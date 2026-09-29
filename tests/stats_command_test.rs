@@ -1,0 +1,52 @@
+#![allow(missing_docs)]
+use anyhow::Result;
+use assert_fs::TempDir;
+use std::collections::BTreeMap;
+use tokio::time::{Duration, sleep};
+use vtcode_core::{
+    Agent,
+    config::ReasoningEffortLevel,
+    config::constants::models::google::GEMINI_3_FLASH_PREVIEW,
+    config::core::PromptCachingConfig,
+    config::types::{AgentConfig, ModelSelectionSource, UiSurfacePreference},
+    core::agent::snapshots::{DEFAULT_CHECKPOINTS_ENABLED, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_SNAPSHOTS},
+    handle_stats_command,
+    ui::theme::DEFAULT_THEME_ID,
+};
+
+#[tokio::test]
+#[expect(clippy::panic_in_result_fn, reason = "test function, assertions are expected")]
+async fn test_handle_stats_command_returns_agent_metrics() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let config = AgentConfig {
+        model: GEMINI_3_FLASH_PREVIEW.to_string(),
+        api_key: "test_key".to_string(),
+        provider: "gemini".to_string(),
+        api_key_env: "GEMINI_API_KEY".to_string(),
+        workspace: temp_dir.path().to_path_buf(),
+        verbose: false,
+        theme: DEFAULT_THEME_ID.to_string(),
+        reasoning_effort: ReasoningEffortLevel::default(),
+        ui_surface: UiSurfacePreference::default(),
+        prompt_cache: PromptCachingConfig::default(),
+        model_source: ModelSelectionSource::WorkspaceConfig,
+        custom_api_keys: BTreeMap::new(),
+        checkpointing_enabled: DEFAULT_CHECKPOINTS_ENABLED,
+        checkpointing_storage_dir: None,
+        checkpointing_max_snapshots: DEFAULT_MAX_SNAPSHOTS,
+        checkpointing_max_age_days: Some(DEFAULT_MAX_AGE_DAYS),
+        quiet: false,
+        max_conversation_turns: 1000,
+        model_behavior: None,
+        openai_chatgpt_auth: None,
+    };
+    let mut agent = Agent::new(config).await?;
+    agent.update_session_stats(5, 3, 1);
+    sleep(Duration::from_millis(1100)).await;
+    let metrics = handle_stats_command(&agent, false, "json".to_string()).await?;
+    assert_eq!(metrics.total_api_calls, 5);
+    assert_eq!(metrics.tool_execution_count, 3);
+    assert_eq!(metrics.error_count, 1);
+    assert!(metrics.session_duration_seconds > 0);
+    Ok(())
+}

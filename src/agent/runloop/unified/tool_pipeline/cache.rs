@@ -1,0 +1,388 @@
+use std::path::Path;
+
+use serde_json::Value;
+use vtcode_core::config::constants::tools;
+use vtcode_core::tools::result_cache::ToolCacheKey;
+use vtcode_core::tools::tool_intent;
+
+/// Determine if a tool is cacheable based on tool type and arguments.
+pub(super) fn is_tool_cacheable(tool_name: &str, args: &Value) -> bool {
+    if is_readonly_repo_browsing_tool(tool_name, args) {
+        return true;
+    }
+
+    if is_stable_tool_catalog_lookup(tool_name, args) {
+        return true;
+    }
+
+    // Cache path-scoped git diff command calls to avoid redundant reruns.
+    if extract_git_diff_cache_target(tool_name, args).is_some() {
+        return true;
+    }
+
+    false
+}
+
+fn is_readonly_repo_browsing_tool(tool_name: &str, args: &Value) -> bool {
+    matches!(tool_name, tools::READ_FILE | tools::LIST_FILES | "grep_search" | "find_files")
+        || tool_name == tools::CODE_SEARCH
+        || (tool_name == tools::UNIFIED_FILE && tool_intent::file_operation_action_is(args, "read"))
+}
+
+fn is_stable_tool_catalog_lookup(tool_name: &str, args: &Value) -> bool {
+    let _ = args;
+    matches!(tool_name, "search_tools" | "get_errors" | "agent_info")
+}
+
+/// Enhanced cache key creation that includes workspace context in the target path
+/// This prevents cache collisions between different workspaces
+pub(super) fn create_enhanced_cache_key(
+    tool_name: &str,
+    args: &Value,
+    cache_target: &str,
+    workspace: &str,
+) -> ToolCacheKey {
+    // For file-based tools, include workspace in the target path to ensure uniqueness
+    // For non-file tools, use a workspace-specific target path
+    let enhanced_target = if cache_target.starts_with('/') || cache_target.contains(':') {
+        // Absolute path or special path - keep as is
+        cache_target.to_string()
+    } else {
+        // Relative path - prefix with workspace to ensure uniqueness
+        format!("{workspace}/{cache_target}")
+    };
+
+    if tool_name == tools::CODE_SEARCH
+        && let Some(identity) = vtcode_core::tools::normalised_code_search_identity(args)
+    {
+        return ToolCacheKey::new(tool_name, &identity, &enhanced_target);
+    }
+
+    ToolCacheKey::from_json(tool_name, args, &enhanced_target)
+}
+
+pub(super) fn cache_target_path(tool_name: &str, args: &Value) -> String {
+    if tool_name == tools::CODE_SEARCH {
+        return args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .unwrap_or(".")
+            .to_string();
+    }
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        return path.to_string();
+    }
+    if let Some(root) = args.get("root").and_then(|v| v.as_str()) {
+        return root.to_string();
+    }
+    if let Some(target) = args.get("target_path").and_then(|v| v.as_str()) {
+        return target.to_string();
+    }
+    if let Some(dir) = args.get("dir").and_then(|v| v.as_str()) {
+        return dir.to_string();
+    }
+    if let Some(diff_target) = extract_git_diff_cache_target(tool_name, args) {
+        return diff_target;
+    }
+
+    tool_name.to_string()
+}
+
+fn extract_git_diff_cache_target(tool_name: &str, args: &Value) -> Option<String> {
+    let parts = command_parts_for_cache(tool_name, args)?;
+    if contains_shell_operator(&parts) {
+        return None;
+    }
+    if !is_git_diff_command(&parts) {
+        return None;
+    }
+    extract_git_diff_path_target(&parts)
+}
+
+pub(super) fn stream_command_parts(tool_name: &str, args: &Value) -> Option<Vec<String>> {
+    if !tool_intent::is_command_run_tool_call(tool_name, args) {
+        return None;
+    }
+
+    let command_value = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .or_else(|| args.get("raw_command"))?;
+    collect_command_parts(command_value, args)
+}
+
+fn command_parts_for_cache(tool_name: &str, args: &Value) -> Option<Vec<String>> {
+    match tool_name {
+        // Keep cache behavior strict for run_pty/shell: only "command" is accepted
+        // (no raw_command fallback) to avoid broadening cacheability semantics.
+        tools::RUN_PTY_CMD | tools::SHELL | "bash" => collect_command_parts(args.get("command")?, args),
+        _ => stream_command_parts(tool_name, args),
+    }
+}
+
+fn collect_command_parts(command_value: &Value, args: &Value) -> Option<Vec<String>> {
+    let mut parts = command_value_to_parts(command_value)?;
+    append_args(&mut parts, args.get("args"));
+    if parts.is_empty() { None } else { Some(parts) }
+}
+
+fn command_value_to_parts(value: &Value) -> Option<Vec<String>> {
+    if let Some(command) = value.as_str() {
+        let parts = shell_words::split(command)
+            .ok()?
+            .into_iter()
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if parts.is_empty() { None } else { Some(parts) }
+    } else if let Some(parts) = value.as_array() {
+        let collected = parts
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if collected.is_empty() { None } else { Some(collected) }
+    } else {
+        None
+    }
+}
+
+fn append_args(parts: &mut Vec<String>, args_value: Option<&Value>) {
+    let Some(args_array) = args_value.and_then(Value::as_array) else {
+        return;
+    };
+
+    for arg in args_array {
+        if let Some(segment) = arg.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+            parts.push(segment.to_string());
+        }
+    }
+}
+
+fn is_git_diff_command(parts: &[String]) -> bool {
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    let basename = Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(first.as_str())
+        .to_ascii_lowercase();
+    if basename != "git" && basename != "git.exe" {
+        return false;
+    }
+
+    parts.iter().skip(1).any(|part| part == "diff")
+}
+
+fn extract_git_diff_path_target(parts: &[String]) -> Option<String> {
+    let diff_index = parts.iter().position(|part| part == "diff")?;
+    if diff_index + 1 >= parts.len() {
+        return None;
+    }
+
+    let mut saw_separator = false;
+    let mut targets = Vec::new();
+
+    for part in parts.iter().skip(diff_index + 1) {
+        if part == "--" {
+            saw_separator = true;
+            continue;
+        }
+
+        if !saw_separator {
+            if part.starts_with('-') {
+                continue;
+            }
+            if !is_path_like(part) {
+                continue;
+            }
+        }
+
+        targets.push(part.clone());
+    }
+
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets.join(" "))
+    }
+}
+
+fn is_path_like(candidate: &str) -> bool {
+    candidate.contains('/') || candidate.contains('\\') || candidate.starts_with("./")
+}
+
+fn contains_shell_operator(parts: &[String]) -> bool {
+    parts.iter().any(|part| {
+        matches!(part.as_str(), "|" | "||" | "&" | "&&" | ";" | ">" | ">>" | "<")
+            || part.contains('|')
+            || part.contains(';')
+            || part.contains("&&")
+            || part.contains("||")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use vtcode_core::config::constants::tools;
+
+    use super::{cache_target_path, create_enhanced_cache_key, is_tool_cacheable, stream_command_parts};
+
+    #[test]
+    fn caches_path_scoped_git_diff_run_pty() {
+        let args = json!({
+            "command": "git diff vtcode-tui/src/core_tui/session/diff_preview.rs"
+        });
+
+        assert!(is_tool_cacheable(tools::RUN_PTY_CMD, &args));
+        assert_eq!(cache_target_path(tools::RUN_PTY_CMD, &args), "vtcode-tui/src/core_tui/session/diff_preview.rs");
+    }
+
+    #[test]
+    fn does_not_cache_git_diff_without_path() {
+        let args = json!({ "command": "git diff" });
+
+        assert!(!is_tool_cacheable(tools::RUN_PTY_CMD, &args));
+        assert_eq!(cache_target_path(tools::RUN_PTY_CMD, &args), tools::RUN_PTY_CMD);
+    }
+
+    #[test]
+    fn caches_command_session_run_with_git_diff_path() {
+        let args = json!({
+            "action": "run",
+            "command": ["git", "diff", "src/main.rs"]
+        });
+
+        assert!(is_tool_cacheable(tools::UNIFIED_EXEC, &args));
+        assert_eq!(cache_target_path(tools::UNIFIED_EXEC, &args), "src/main.rs");
+    }
+
+    #[test]
+    fn does_not_cache_non_run_command_session_action() {
+        let args = json!({
+            "action": "poll",
+            "session_id": "run-123"
+        });
+
+        assert!(!is_tool_cacheable(tools::UNIFIED_EXEC, &args));
+    }
+
+    #[test]
+    fn does_not_cache_compound_shell_command_with_diff() {
+        let args = json!({
+            "command": "git diff src/main.rs && echo done"
+        });
+
+        assert!(!is_tool_cacheable(tools::RUN_PTY_CMD, &args));
+    }
+
+    #[test]
+    fn caches_quoted_path_with_spaces() {
+        let args = json!({
+            "command": "git diff \"dir with space/file.rs\""
+        });
+
+        assert!(is_tool_cacheable(tools::RUN_PTY_CMD, &args));
+        assert_eq!(cache_target_path(tools::RUN_PTY_CMD, &args), "dir with space/file.rs");
+    }
+
+    #[test]
+    fn stream_command_parts_supports_raw_command_for_run_pty() {
+        let args = json!({
+            "raw_command": "cargo check -p vtcode-core"
+        });
+
+        assert_eq!(
+            stream_command_parts(tools::RUN_PTY_CMD, &args),
+            Some(vec![
+                "cargo".to_string(),
+                "check".to_string(),
+                "-p".to_string(),
+                "vtcode-core".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn stream_command_parts_skips_non_run_command_session() {
+        let args = json!({
+            "action": "poll",
+            "session_id": "run-123"
+        });
+
+        assert_eq!(stream_command_parts(tools::UNIFIED_EXEC, &args), None);
+    }
+
+    #[test]
+    fn caches_file_operation_read_calls() {
+        let args = json!({
+            "action": "read",
+            "path": "src/main.rs"
+        });
+
+        assert!(is_tool_cacheable(tools::UNIFIED_FILE, &args));
+        assert_eq!(cache_target_path(tools::UNIFIED_FILE, &args), "src/main.rs");
+    }
+
+    #[test]
+    fn caches_code_search_with_normalised_target() {
+        let args = json!({
+            "query": "Widget",
+            "path": " src ",
+            "file_types": [".rs"],
+            "result_types": ["path", "definition"],
+            "max_results": 5
+        });
+
+        assert!(is_tool_cacheable(tools::CODE_SEARCH, &args));
+        assert_eq!(cache_target_path(tools::CODE_SEARCH, &args), "src");
+    }
+
+    #[test]
+    fn code_search_cache_identity_includes_effective_limit_and_canonicalises_filters() {
+        let first = json!({
+            "query": " Widget ",
+            "path": "src",
+            "file_types": [".rs", "python", "rust"],
+            "result_types": ["path", "definition", "path"],
+            "max_results": 5
+        });
+        let second = json!({
+            "query": "Widget",
+            "path": "src",
+            "file_types": ["rust", ".py"],
+            "result_types": ["definition", "path"],
+            "max_results": 100
+        });
+
+        assert_ne!(
+            create_enhanced_cache_key(tools::CODE_SEARCH, &first, "src", "/workspace"),
+            create_enhanced_cache_key(tools::CODE_SEARCH, &second, "src", "/workspace"),
+            "different effective limits must not share cached results"
+        );
+
+        let explicit_default = json!({
+            "query": "Widget",
+            "path": "src",
+            "file_types": ["rust", ".py"],
+            "result_types": ["definition", "path"],
+            "max_results": 20
+        });
+        let omitted_default = json!({
+            "query": " Widget ",
+            "path": "src",
+            "file_types": [".rs", "python"],
+            "result_types": ["path", "definition"]
+        });
+        assert_eq!(
+            create_enhanced_cache_key(tools::CODE_SEARCH, &explicit_default, "src", "/workspace"),
+            create_enhanced_cache_key(tools::CODE_SEARCH, &omitted_default, "src", "/workspace"),
+            "omitted and explicit default limits must share cached results"
+        );
+    }
+}

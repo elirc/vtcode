@@ -1,0 +1,18 @@
+allow-branch = ["main"]
+shared-version = true
+dependent-version = "upgrade"
+consolidate-commits = true
+push = true
+push-remote = "origin"
+publish = true
+tag-name = "{{version}}"
+tag-message = "Release {{version}}"
+# Skip pre-release verification (tests/builds) - run manually before release
+# Snapshot tests can fail and block releases; run `cargo nextest run` manually instead
+verify = false
+[rate-limit]
+new-packages = 5
+existing-packages = 300
+pre-release-commit-message = "chore(release): bump version to {{version}} [skip ci]"
+sign-commit = false
+sign-tag = false

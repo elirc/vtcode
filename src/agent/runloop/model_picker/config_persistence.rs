@@ -1,0 +1,230 @@
+use anyhow::Result;
+
+use vtcode_config::auth::CustomApiKeyStorage;
+use vtcode_core::config::loader::VTCodeConfig;
+use vtcode_core::config::models::Provider;
+use vtcode_core::utils::dot_config::update_model_preference;
+
+use super::ModelSelectionResult;
+
+fn synced_openai_service_tier(selection: &ModelSelectionResult) -> Option<vtcode_config::OpenAIServiceTier> {
+    (selection.provider_enum == Some(Provider::OpenAI) && selection.service_tier_supported)
+        .then_some(selection.service_tier)
+        .flatten()
+}
+
+pub(super) async fn persist_selection(
+    workspace: &std::path::Path,
+    selection: &ModelSelectionResult,
+) -> Result<VTCodeConfig> {
+    let mut manager = crate::main_helpers::load_workspace_config(workspace)?;
+    let mut config = manager.config().clone();
+    config.agent.provider = selection.provider.clone();
+    apply_api_key_state(&mut config, selection);
+    config.agent.default_model = selection.model.clone();
+    config.agent.reasoning_effort = selection.reasoning;
+    config.provider.openai.service_tier = synced_openai_service_tier(selection);
+
+    // Store MiMo auth method when provider is MiMo
+    if selection.provider_enum == Some(Provider::MiMo) {
+        config.provider.mimo_auth_method = selection.mimo_auth_method;
+    }
+
+    manager.save_config(&config)?;
+    update_model_preference(&selection.provider, &selection.model).await.ok();
+    Ok(config)
+}
+
+pub(crate) async fn persist_lightweight_selection(workspace: &std::path::Path, model: &str) -> Result<VTCodeConfig> {
+    let mut manager = crate::main_helpers::load_workspace_config(workspace)?;
+    let mut config = manager.config().clone();
+    config.agent.small_model.enabled = true;
+    config.agent.small_model.model = model.to_string();
+    manager.save_config(&config)?;
+    Ok(config)
+}
+
+fn apply_api_key_state(config: &mut VTCodeConfig, selection: &ModelSelectionResult) {
+    if selection.provider_enum == Some(Provider::OpenAI) && selection.uses_chatgpt_auth {
+        config.agent.api_key_env = selection.env_key.clone();
+        config.agent.custom_api_keys.remove(&selection.provider);
+        return;
+    }
+
+    if uses_provider_api_key(selection) {
+        config.agent.api_key_env = selection.env_key.clone();
+        if selection.api_key.is_some() {
+            sync_stored_api_key(config, selection);
+        }
+        return;
+    }
+
+    config.agent.api_key_env.clear();
+    if selection.api_key.is_some() {
+        clear_stored_api_key(config, &selection.provider);
+    }
+}
+
+fn uses_provider_api_key(selection: &ModelSelectionResult) -> bool {
+    if selection.provider_enum.is_some_and(|provider| provider.uses_managed_auth()) {
+        return false;
+    }
+
+    match selection.provider_enum {
+        Some(Provider::Ollama) => is_cloud_ollama_model(&selection.model),
+        Some(Provider::LmStudio | Provider::LlamaCpp) => false,
+        _ => true,
+    }
+}
+
+fn is_cloud_ollama_model(model: &str) -> bool {
+    model.contains(":cloud") || model.contains("-cloud")
+}
+
+fn sync_stored_api_key(config: &mut VTCodeConfig, selection: &ModelSelectionResult) {
+    if selection.provider_enum == Some(Provider::OpenAI) && selection.uses_chatgpt_auth {
+        return;
+    }
+
+    if let Some(api_key) = selection.api_key.as_deref() {
+        let storage_mode = config.agent.credential_storage_mode;
+        let key_storage = CustomApiKeyStorage::new(&selection.provider);
+        if let Err(err) = key_storage.store(api_key, storage_mode) {
+            tracing::warn!("Failed to store API key for provider '{}' securely: {}", selection.provider, err);
+        }
+        config.agent.custom_api_keys.insert(selection.provider.clone(), String::new());
+        return;
+    }
+
+    clear_stored_api_key(config, &selection.provider);
+}
+
+fn clear_stored_api_key(config: &mut VTCodeConfig, provider: &str) {
+    config.agent.custom_api_keys.remove(provider);
+    let storage_mode = config.agent.credential_storage_mode;
+    let key_storage = CustomApiKeyStorage::new(provider);
+    let _ = key_storage.clear(storage_mode);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_cloud_ollama_model, persist_lightweight_selection, synced_openai_service_tier, uses_provider_api_key,
+    };
+    use crate::agent::runloop::model_picker::ModelSelectionResult;
+    use vtcode_config::OpenAIServiceTier;
+    use vtcode_config::VTCodeConfig;
+    use vtcode_core::config::loader::ConfigManager;
+    use vtcode_core::config::models::Provider;
+    use vtcode_core::config::types::ReasoningEffortLevel;
+
+    fn selection(provider_enum: Option<Provider>, provider: &str, model: &str) -> ModelSelectionResult {
+        ModelSelectionResult {
+            provider: provider.to_string(),
+            provider_label: provider.to_string(),
+            provider_enum,
+            model: model.to_string(),
+            model_display: model.to_string(),
+            known_model: false,
+            reasoning_supported: false,
+            reasoning: ReasoningEffortLevel::Medium,
+            reasoning_changed: false,
+            service_tier_supported: false,
+            service_tier: None,
+            service_tier_changed: false,
+            api_key: None,
+            env_key: "TEST_API_KEY".to_string(),
+            requires_api_key: false,
+            uses_chatgpt_auth: false,
+            mimo_auth_method: None,
+        }
+    }
+
+    #[test]
+    fn detects_cloud_ollama_models() {
+        assert!(is_cloud_ollama_model("llama3:cloud"));
+        assert!(is_cloud_ollama_model("deepseek-cloud"));
+        assert!(!is_cloud_ollama_model("llama3"));
+    }
+
+    #[test]
+    fn local_ollama_models_skip_provider_api_key_state() {
+        assert!(!uses_provider_api_key(&selection(Some(Provider::Ollama), "ollama", "qwen3-coder")));
+    }
+
+    #[test]
+    fn cloud_ollama_models_keep_provider_api_key_state() {
+        assert!(uses_provider_api_key(&selection(Some(Provider::Ollama), "ollama", "qwen3-coder:cloud")));
+    }
+
+    #[test]
+    fn non_ollama_providers_keep_provider_api_key_state() {
+        assert!(uses_provider_api_key(&selection(Some(Provider::OpenAI), "openai", "gpt-5.2")));
+    }
+
+    #[test]
+    fn managed_auth_providers_skip_provider_api_key_state() {
+        assert!(!uses_provider_api_key(&selection(
+            Some(Provider::Copilot),
+            "copilot",
+            vtcode_core::config::constants::models::copilot::DEFAULT_MODEL
+        )));
+    }
+
+    #[test]
+    fn synced_openai_service_tier_tracks_supported_openai_selection() {
+        let mut selected = selection(Some(Provider::OpenAI), "openai", "gpt-5.4");
+        selected.service_tier_supported = true;
+        selected.service_tier = Some(OpenAIServiceTier::Priority);
+
+        assert_eq!(synced_openai_service_tier(&selected), Some(OpenAIServiceTier::Priority));
+    }
+
+    #[test]
+    fn synced_openai_service_tier_tracks_flex_selection() {
+        let mut selected = selection(Some(Provider::OpenAI), "openai", "gpt-5.4");
+        selected.service_tier_supported = true;
+        selected.service_tier = Some(OpenAIServiceTier::Flex);
+
+        assert_eq!(synced_openai_service_tier(&selected), Some(OpenAIServiceTier::Flex));
+    }
+
+    #[test]
+    fn synced_openai_service_tier_clears_stale_values_outside_supported_openai() {
+        let mut selected = selection(Some(Provider::Ollama), "ollama", "qwen3-coder");
+        selected.service_tier_supported = true;
+        selected.service_tier = Some(OpenAIServiceTier::Priority);
+
+        assert_eq!(synced_openai_service_tier(&selected), None);
+
+        let mut unsupported_openai = selection(Some(Provider::OpenAI), "openai", "gpt-oss-20b");
+        unsupported_openai.service_tier_supported = false;
+        unsupported_openai.service_tier = Some(OpenAIServiceTier::Priority);
+
+        assert_eq!(synced_openai_service_tier(&unsupported_openai), None);
+    }
+
+    #[tokio::test]
+    async fn persist_lightweight_selection_enables_shared_model_and_saves_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut initial = VTCodeConfig::default();
+        initial.agent.provider = "openai".to_string();
+        initial.agent.default_model = "gpt-5.4".to_string();
+        ConfigManager::save_config_to_path(temp.path().join("vtcode.toml"), &initial).expect("seed config");
+
+        let updated = persist_lightweight_selection(temp.path(), "gpt-5.4-mini")
+            .await
+            .expect("persist lightweight model");
+
+        assert!(updated.agent.small_model.enabled);
+        assert_eq!(updated.agent.small_model.model, "gpt-5.4-mini");
+        assert_eq!(updated.agent.default_model, "gpt-5.4");
+        assert_eq!(updated.agent.provider, "openai");
+
+        let manager = ConfigManager::load_from_workspace(temp.path()).expect("load persisted config");
+        assert!(manager.config().agent.small_model.enabled);
+        assert_eq!(manager.config().agent.small_model.model, "gpt-5.4-mini");
+        assert_eq!(manager.config().agent.default_model, "gpt-5.4");
+        assert_eq!(manager.config().agent.provider, "openai");
+    }
+}

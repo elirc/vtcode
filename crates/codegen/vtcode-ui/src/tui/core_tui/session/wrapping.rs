@@ -1,0 +1,340 @@
+//! URL and path-preserving text wrapping.
+//!
+//! Wraps text while keeping URLs and file paths as atomic units to preserve
+//! terminal link detection and transcript file hit-testing.
+
+use ratatui::prelude::*;
+use ratatui::widgets::Paragraph;
+use regex::Regex;
+use std::borrow::Cow;
+use std::sync::LazyLock;
+use unicode_width::UnicodeWidthStr;
+
+/// URL/file token detection pattern - matches common URL formats and path-like tokens.
+static PRESERVED_TOKEN_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\[\]{}|^]+|[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}(/[^\s<>\[\]{}|^]*)?|localhost:\d+|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?|`(?:file://|~/|/|\./|\.\./|[A-Za-z]:[\\/]|[A-Za-z0-9._-]+[\\/])[^`]+`|"(?:file://|~/|/|\./|\.\./|[A-Za-z]:[\\/]|[A-Za-z0-9._-]+[\\/])[^"]+"|'(?:file://|~/|/|\./|\.\./|[A-Za-z]:[\\/]|[A-Za-z0-9._-]+[\\/])[^']+'|(?:\./|\../|~/|/)[^\s<>\[\]{}|^]+|(?:[A-Za-z]:[\\/][^\s<>\[\]{}|^]+)|(?:[A-Za-z0-9._-]+[\\/][^\s<>\[\]{}|^]+)"#,
+    )
+    .expect("invalid URL/path token regex")
+});
+
+/// Check if text contains a preserved URL/path token.
+pub fn contains_preserved_token(text: &str) -> bool {
+    PRESERVED_TOKEN_PATTERN.is_match(text)
+}
+
+/// Wrap a line, preserving URLs as atomic units.
+///
+/// - Lines without URLs: delegated to standard wrapping
+/// - URL-only lines: returned unwrapped if they fit
+/// - Mixed lines: URLs kept intact, surrounding text wrapped normally
+pub fn wrap_line_preserving_urls(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
+    if max_width == 0 {
+        return vec![Line::default()];
+    }
+
+    let text: Cow<'_, str> = match line.spans.as_slice() {
+        [span] => span.content.clone(),
+        _ => Cow::Owned(line.spans.iter().map(|s| s.content.as_ref()).collect()),
+    };
+
+    // No URLs - use standard wrapping (delegates to text_utils)
+    if !contains_preserved_token(&text) {
+        return super::text_utils::wrap_line(line, max_width);
+    }
+
+    // Find all preserved tokens in the text
+    let urls: Vec<_> = PRESERVED_TOKEN_PATTERN
+        .find_iter(&text)
+        .map(|m| (m.start(), m.end(), m.as_str()))
+        .collect();
+
+    // Single URL that fits - return unwrapped for terminal link detection
+    if urls.len() == 1 && urls[0].0 == 0 && urls[0].1 == text.len() && text.width() <= max_width {
+        return vec![line];
+    }
+    // URL too wide - fall through to wrap it
+
+    // Mixed content - split around URLs and wrap each segment
+    wrap_mixed_content(line, &text, max_width, &urls)
+}
+
+/// Wrap text that contains URLs, keeping URLs intact.
+fn wrap_mixed_content(
+    line: Line<'static>,
+    text: &str,
+    max_width: usize,
+    urls: &[(usize, usize, &str)],
+) -> Vec<Line<'static>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let mut result = Vec::with_capacity(urls.len() + 1);
+    let mut current_line: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+    let mut text_pos = 0usize;
+
+    fn trim_trailing_wrap_whitespace(spans: &mut Vec<Span<'static>>) {
+        while let Some(last) = spans.last_mut() {
+            let trimmed_len = last.content.trim_end_matches(char::is_whitespace).len();
+            if trimmed_len == last.content.len() {
+                break;
+            }
+            if trimmed_len == 0 {
+                spans.pop();
+                continue;
+            }
+            last.content.to_mut().truncate(trimmed_len);
+            break;
+        }
+    }
+
+    let flush_line = |spans: &mut Vec<Span<'static>>, result: &mut Vec<Line<'static>>| {
+        if spans.is_empty() {
+            result.push(Line::default());
+        } else {
+            trim_trailing_wrap_whitespace(spans);
+            result.push(Line::from(std::mem::take(spans)));
+        }
+    };
+
+    // Merge spans into a single style for simplicity when dealing with URLs
+    let default_style = line.spans.first().map(|s| s.style).unwrap_or_default();
+
+    let push_wrapped_token = |token: &str,
+                              current_line: &mut Vec<Span<'static>>,
+                              current_width: &mut usize,
+                              result: &mut Vec<Line<'static>>| {
+        for grapheme in UnicodeSegmentation::graphemes(token, true) {
+            let grapheme_width = grapheme.width();
+            if grapheme_width == 0 {
+                current_line.push(Span::styled(grapheme.to_string(), default_style));
+                continue;
+            }
+            if *current_width + grapheme_width > max_width && *current_width > 0 {
+                flush_line(current_line, result);
+                *current_width = 0;
+            }
+            current_line.push(Span::styled(grapheme.to_string(), default_style));
+            *current_width += grapheme_width;
+        }
+    };
+
+    let push_wrapped_text = |segment: &str,
+                             current_line: &mut Vec<Span<'static>>,
+                             current_width: &mut usize,
+                             result: &mut Vec<Line<'static>>| {
+        for piece in segment.split_inclusive('\n') {
+            let mut text = piece;
+            let mut had_newline = false;
+            if let Some(stripped) = text.strip_suffix('\n') {
+                text = stripped;
+                had_newline = true;
+                if let Some(without_carriage) = text.strip_suffix('\r') {
+                    text = without_carriage;
+                }
+            }
+
+            for token in UnicodeSegmentation::split_word_bounds(text) {
+                if token.is_empty() {
+                    continue;
+                }
+
+                let token_width = token.width();
+                if token_width == 0 {
+                    current_line.push(Span::styled(token.to_string(), default_style));
+                    continue;
+                }
+
+                let token_is_whitespace = token.chars().all(char::is_whitespace);
+                let has_content = *current_width > 0;
+
+                if token_is_whitespace && !result.is_empty() && !has_content {
+                    continue;
+                }
+
+                if *current_width + token_width <= max_width {
+                    current_line.push(Span::styled(token.to_string(), default_style));
+                    *current_width += token_width;
+                    continue;
+                }
+
+                if token_is_whitespace {
+                    if has_content {
+                        flush_line(current_line, result);
+                        *current_width = 0;
+                    }
+                    continue;
+                }
+
+                if token_width <= max_width {
+                    if has_content {
+                        flush_line(current_line, result);
+                        *current_width = 0;
+                    }
+                    current_line.push(Span::styled(token.to_string(), default_style));
+                    *current_width += token_width;
+                    continue;
+                }
+
+                push_wrapped_token(token, current_line, current_width, result);
+            }
+
+            if had_newline {
+                flush_line(current_line, result);
+                *current_width = 0;
+            }
+        }
+    };
+
+    for (url_start, url_end, url_text) in urls {
+        // Process text before this URL
+        if *url_start > text_pos {
+            push_wrapped_text(&text[text_pos..*url_start], &mut current_line, &mut current_width, &mut result);
+        }
+
+        // Add URL — keep atomic if it fits, otherwise break it across lines
+        let url_width = url_text.width();
+        if url_width <= max_width {
+            if current_width > 0 && current_width + url_width > max_width {
+                flush_line(&mut current_line, &mut result);
+                current_width = 0;
+            }
+            current_line.push(Span::styled(url_text.to_string(), default_style));
+            current_width += url_width;
+        } else {
+            // URL is wider than max_width — break it grapheme-by-grapheme
+            if current_width > 0 {
+                flush_line(&mut current_line, &mut result);
+                current_width = 0;
+            }
+            push_wrapped_token(url_text, &mut current_line, &mut current_width, &mut result);
+        }
+
+        text_pos = *url_end;
+    }
+
+    // Process remaining text after last URL
+    if text_pos < text.len() {
+        push_wrapped_text(&text[text_pos..], &mut current_line, &mut current_width, &mut result);
+    }
+
+    flush_line(&mut current_line, &mut result);
+    if result.is_empty() {
+        result.push(Line::default());
+    }
+    result
+}
+
+/// Wrap multiple lines with URL preservation.
+pub fn wrap_lines_preserving_urls(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    if max_width == 0 {
+        return vec![Line::default()];
+    }
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_line_preserving_urls(line, max_width))
+        .collect()
+}
+
+/// Calculate wrapped height using Paragraph::line_count.
+pub fn calculate_wrapped_height(text: &str, width: u16) -> usize {
+    if width == 0 {
+        return text.lines().count().max(1);
+    }
+    Paragraph::new(text).line_count(width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_detection() {
+        assert!(contains_preserved_token("https://example.com"));
+        assert!(contains_preserved_token("example.com/path"));
+        assert!(contains_preserved_token("localhost:8080"));
+        assert!(contains_preserved_token("192.168.1.1:8080"));
+        assert!(!contains_preserved_token("not a url"));
+    }
+
+    #[test]
+    fn test_file_path_detection() {
+        assert!(contains_preserved_token("src/main.rs"));
+        assert!(contains_preserved_token("./src/main.rs"));
+        assert!(contains_preserved_token("/tmp/example.txt"));
+        assert!(contains_preserved_token("\"./docs/My Notes.md\""));
+        assert!(contains_preserved_token("`/Users/example/Library/Application Support/Code/User/settings.json`"));
+    }
+
+    #[test]
+    fn test_url_only_preserved() {
+        let line = Line::from(Span::raw("https://example.com"));
+        let wrapped = wrap_line_preserving_urls(line, 80);
+        assert_eq!(wrapped.len(), 1);
+        assert!(wrapped[0].spans.iter().any(|s| s.content.contains("https://")));
+    }
+
+    #[test]
+    fn test_mixed_content() {
+        let line = Line::from(Span::raw("See https://example.com for info"));
+        let wrapped = wrap_line_preserving_urls(line, 25);
+        let all_text: String = wrapped
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(all_text.contains("https://example.com"));
+        assert!(all_text.contains("See"));
+    }
+
+    #[test]
+    fn test_quoted_path_with_spaces_is_preserved() {
+        let line = Line::from(Span::raw("Open \"./docs/My Notes.md\" for details"));
+        let wrapped = wrap_line_preserving_urls(line, 18);
+        let all_text: String = wrapped
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+
+        assert!(all_text.contains("\"./docs/My Notes.md\""));
+    }
+
+    #[test]
+    fn test_long_url_breaks_across_lines() {
+        let long_url = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid";
+        let line = Line::from(Span::raw(long_url.to_string()));
+        let wrapped = wrap_line_preserving_urls(line, 80);
+        assert!(wrapped.len() > 1, "Long URL should wrap across multiple lines");
+        let all_text: String = wrapped
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(all_text, long_url, "All characters should be preserved");
+    }
+
+    #[test]
+    fn test_no_url_delegates() {
+        let line = Line::from(Span::raw("Regular text without URLs"));
+        let wrapped = wrap_line_preserving_urls(line, 10);
+        assert!(!wrapped.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_content_prefers_word_boundaries_around_urls() {
+        let line = Line::from(Span::raw("alpha https://x.io beta gamma"));
+        let wrapped = wrap_line_preserving_urls(line, 12);
+        let rendered: Vec<String> = wrapped
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "alpha".to_string(),
+                "https://x.io".to_string(),
+                "beta gamma".to_string()
+            ]
+        );
+    }
+}

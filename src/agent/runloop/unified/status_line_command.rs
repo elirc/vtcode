@@ -1,0 +1,288 @@
+use std::path::Path;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command as TokioCommand;
+use vtcode_core::config::StatusLineConfig;
+use vtcode_core::tools::dominant_workspace_language;
+use vtcode_core::utils::ansi_parser::strip_ansi;
+
+use crate::agent::runloop::git::GitStatusSummary;
+use crate::agent::runloop::unified::session_setup::preferred_display_language_for_workspace;
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_status_line_command(
+    command: &str,
+    workspace: &Path,
+    model_id: &str,
+    model_display: &str,
+    reasoning: &str,
+    git: Option<&GitStatusSummary>,
+    config: &StatusLineConfig,
+) -> Result<Option<String>> {
+    let mut process = TokioCommand::new("sh");
+    process.arg("-c").arg(command);
+    process.current_dir(workspace);
+    process.stdin(std::process::Stdio::piped());
+    process.stdout(std::process::Stdio::piped());
+    process.stderr(std::process::Stdio::null());
+
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("failed to spawn status line command `{command}`"))?;
+
+    let mut stdout_pipe = child.stdout.take().context("status line command missing stdout pipe")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload = StatusLineCommandPayload::new(workspace, model_id, model_display, reasoning, git);
+        let mut payload_bytes = serde_json::to_vec(&payload).context("failed to serialize status line payload")?;
+        payload_bytes.push(b'\n');
+
+        stdin
+            .write_all(&payload_bytes)
+            .await
+            .context("failed to write status line payload")?;
+        stdin.shutdown().await.context("failed to close status line command stdin")?;
+    }
+
+    let timeout_ms = std::cmp::max(config.command_timeout_ms, 1);
+    let timeout_duration = Duration::from_millis(timeout_ms);
+    let wait_result = {
+        let wait = child.wait();
+        tokio::pin!(wait);
+        tokio::time::timeout(timeout_duration, &mut wait).await
+    };
+
+    let status = match wait_result {
+        Ok(status_res) => status_res.with_context(|| format!("failed to wait for status line command `{command}`"))?,
+        Err(_) => {
+            child
+                .start_kill()
+                .with_context(|| format!("failed to kill timed out status line command `{command}`"))?;
+            child
+                .wait()
+                .await
+                .with_context(|| format!("failed to wait for killed status line command `{command}` after timeout"))?;
+            return Err(anyhow!("status line command `{command}` timed out after {timeout_ms}ms"));
+        }
+    };
+
+    let mut stdout_bytes = Vec::new();
+    stdout_pipe
+        .read_to_end(&mut stdout_bytes)
+        .await
+        .context("failed to read status line command stdout")?;
+
+    if !status.success() {
+        return Err(anyhow!("status line command exited with status {status}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let first_line = stdout
+        .lines()
+        .next()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .map(|line| strip_ansi(&line));
+
+    Ok(first_line)
+}
+
+#[derive(Serialize)]
+struct StatusLineCommandPayload {
+    hook_event_name: &'static str,
+    cwd: String,
+    workspace: StatusLineWorkspace,
+    model: StatusLineModel,
+    runtime: StatusLineRuntime,
+    context: Option<StatusLineContext>,
+    git: Option<StatusLineGit>,
+    version: &'static str,
+}
+
+#[derive(Serialize)]
+struct StatusLineContext {
+    utilization_percent: f64,
+    total_tokens: usize,
+    semantic_value_per_token: f64,
+}
+
+impl StatusLineCommandPayload {
+    fn new(
+        workspace: &Path,
+        model_id: &str,
+        model_display: &str,
+        reasoning: &str,
+        git: Option<&GitStatusSummary>,
+    ) -> Self {
+        Self::with_context(workspace, model_id, model_display, reasoning, git, None)
+    }
+
+    fn with_context(
+        workspace: &Path,
+        model_id: &str,
+        model_display: &str,
+        reasoning: &str,
+        git: Option<&GitStatusSummary>,
+        context: Option<StatusLineContext>,
+    ) -> Self {
+        let workspace_path = workspace.to_string_lossy().into_owned();
+        Self {
+            hook_event_name: "Status",
+            cwd: workspace_path.clone(),
+            workspace: StatusLineWorkspace {
+                current_dir: workspace_path.clone(),
+                project_dir: workspace_path,
+                dominant_language: dominant_workspace_language(workspace),
+                active_language: preferred_display_language_for_workspace(workspace),
+            },
+            model: StatusLineModel {
+                id: model_id.to_string(),
+                display_name: model_display.to_string(),
+            },
+            runtime: StatusLineRuntime { reasoning_effort: reasoning.to_string() },
+            context,
+            git: git.map(StatusLineGit::from_summary),
+            version: env!("CARGO_PKG_VERSION"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StatusLineWorkspace {
+    current_dir: String,
+    project_dir: String,
+    dominant_language: Option<String>,
+    active_language: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StatusLineModel {
+    id: String,
+    display_name: String,
+}
+
+#[derive(Serialize)]
+struct StatusLineRuntime {
+    reasoning_effort: String,
+}
+
+#[derive(Serialize)]
+struct StatusLineGit {
+    branch: String,
+    dirty: bool,
+}
+
+impl StatusLineGit {
+    fn from_summary(summary: &GitStatusSummary) -> Self {
+        Self {
+            branch: summary.branch.clone(),
+            dirty: summary.dirty,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatusLineCommandPayload;
+    use serde_json::Value;
+    use serial_test::serial;
+    use std::fs;
+    use tempfile::TempDir;
+    use vtcode_commons::env_lock::{remove_var as remove_env_var, set_var as set_env_var};
+    use vtcode_core::ide_context::{IDE_CONTEXT_ENV_VAR, LEGACY_VSCODE_CONTEXT_ENV_VAR};
+
+    #[test]
+    #[serial]
+    fn payload_includes_dominant_workspace_language() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        fs::create_dir_all(workspace.path().join("src")).expect("create src");
+        fs::write(workspace.path().join("src/lib.rs"), "fn alpha() {}\n").expect("write rust");
+
+        remove_env_var(IDE_CONTEXT_ENV_VAR);
+        remove_env_var(LEGACY_VSCODE_CONTEXT_ENV_VAR);
+
+        let payload = StatusLineCommandPayload::new(workspace.path(), "model", "Model", "low", None);
+        let value = serde_json::to_value(payload).expect("serialize payload");
+
+        assert_eq!(value["workspace"]["dominant_language"], Value::String("Rust".to_string()));
+        assert_eq!(value["workspace"]["active_language"], Value::String("Rust".to_string()));
+
+        remove_env_var(IDE_CONTEXT_ENV_VAR);
+        remove_env_var(LEGACY_VSCODE_CONTEXT_ENV_VAR);
+    }
+
+    #[test]
+    #[serial]
+    fn payload_prefers_active_editor_language_from_snapshot() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        fs::create_dir_all(workspace.path().join("src")).expect("create src");
+        fs::write(workspace.path().join("src/lib.rs"), "fn alpha() {}\n").expect("write rust");
+        let snapshot_path = workspace.path().join("snapshot.json");
+        fs::write(
+            &snapshot_path,
+            format!(
+                r#"{{
+                    "version": 1,
+                    "provider_family": "generic",
+                    "workspace_root": "{}",
+                    "active_file": {{
+                        "path": "{}/script.py",
+                        "language_id": "python",
+                        "dirty": false,
+                        "truncated": false
+                    }}
+                }}"#,
+                workspace.path().display(),
+                workspace.path().display()
+            ),
+        )
+        .expect("write snapshot");
+
+        set_env_var(IDE_CONTEXT_ENV_VAR, &snapshot_path);
+
+        let payload = StatusLineCommandPayload::new(workspace.path(), "model", "Model", "low", None);
+        let value = serde_json::to_value(payload).expect("serialize payload");
+
+        assert_eq!(value["workspace"]["active_language"], Value::String("Python".to_string()));
+
+        remove_env_var(IDE_CONTEXT_ENV_VAR);
+    }
+
+    #[test]
+    #[serial]
+    fn payload_prefers_workspace_ide_context_snapshot_without_env() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        fs::create_dir_all(workspace.path().join("src")).expect("create src");
+        fs::create_dir_all(workspace.path().join(".vtcode")).expect("create .vtcode");
+        fs::write(workspace.path().join("src/lib.rs"), "fn alpha() {}\n").expect("write rust");
+        fs::write(
+            workspace.path().join(".vtcode/ide-context.json"),
+            format!(
+                r#"{{
+                    "version": 1,
+                    "provider_family": "vscode_compatible",
+                    "workspace_root": "{}",
+                    "active_file": {{
+                        "path": "{}/script.py",
+                        "language_id": "python",
+                        "dirty": false,
+                        "truncated": false
+                    }}
+                }}"#,
+                workspace.path().display(),
+                workspace.path().display()
+            ),
+        )
+        .expect("write snapshot");
+
+        remove_env_var(IDE_CONTEXT_ENV_VAR);
+
+        let payload = StatusLineCommandPayload::new(workspace.path(), "model", "Model", "low", None);
+        let value = serde_json::to_value(payload).expect("serialize payload");
+
+        assert_eq!(value["workspace"]["active_language"], Value::String("Python".to_string()));
+    }
+}

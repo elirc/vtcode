@@ -1,0 +1,256 @@
+//! Centralized reasoning utilities for detecting and transforming agent reasoning.
+//!
+//! This module provides functions for detecting patterns in agent reasoning
+//! and implementing Chain-of-Thought monitoring patterns from The Agentic AI Handbook.
+//!
+//! ## Chain-of-Thought Monitoring Pattern
+//!
+//! Monitor agent reasoning in real-time to enable early intervention:
+//! - First tool call reveals understanding—monitor closely
+//! - Interrupt immediately if wrong approach detected
+//! - "Have your finger on the trigger to escape and interrupt any bad behavior"
+
+use once_cell::sync::Lazy;
+use regex::Regex;
+use vtcode_core::config::ReasoningDisplayMode;
+use vtcode_core::config::loader::VTCodeConfig;
+use vtcode_core::llm::provider as uni;
+
+static RUSHING_PATTERNS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(wrapping up|running out of time|quick summary|to conclude|finishing up|just to be safe|that.?s it|time to stop)").expect("valid regex pattern")
+});
+
+static UNCERTAIN_PATTERNS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(not sure|i.?m not certain|might be wrong|could be|sorry|apologies)").expect("valid regex pattern")
+});
+
+static COMPLEXITY_AVOIDANCE_PATTERNS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(too complex|too many|let.?s skip|for now|we can worry about|later)").expect("valid regex pattern")
+});
+
+/// Matches reasoning lines that announce a decision, plan, or tool invocation.
+///
+/// Used to apply light emphasis when rendering the on-screen chain-of-thought
+/// so the agent's key decisions and tool calls stand out from filler text.
+static DECISION_TOOL_PATTERNS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)(^(i will|i'?ll|let me|next,|now i|i need to|i should|i can|step \d|plan:|approach:)|tool call|call the .* tool|run the .* (command|tool)|execute|invoke|use the .* tool)",
+    )
+    .expect("valid regex pattern")
+});
+
+/// Returns whether the active provider/model pair supports reasoning traces.
+pub(crate) fn model_supports_reasoning(provider: &dyn uni::LLMProvider, model: &str) -> bool {
+    uni::get_cached_capabilities(provider, model).reasoning
+}
+
+/// Resolve runtime reasoning visibility with provider/model capability gating.
+///
+/// Reasoning output is always hidden when the model does not support reasoning traces.
+pub(crate) fn resolve_reasoning_visibility(config: Option<&VTCodeConfig>, supports_reasoning: bool) -> bool {
+    if !supports_reasoning {
+        return false;
+    }
+
+    let Some(cfg) = config else {
+        return true;
+    };
+
+    match cfg.ui.reasoning_display_mode {
+        ReasoningDisplayMode::Always => true,
+        ReasoningDisplayMode::Hidden => false,
+        ReasoningDisplayMode::Toggle | ReasoningDisplayMode::Unknown => cfg.ui.reasoning_visible_default,
+    }
+}
+
+/// Detects if reasoning text indicates the agent is giving up on a task.
+///
+/// Looks for patterns like "stop", "probably stop", "can't continue", "too complex", etc.
+pub(crate) fn is_giving_up_reasoning(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    let giving_up_patterns = [
+        "stop",
+        "can't continue",
+        "cannot continue",
+        "too complex",
+        "probably stop",
+        "should stop",
+        "unable to continue",
+        "give up",
+    ];
+
+    giving_up_patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+/// Detects rushing behavior indicating context anxiety.
+pub(crate) fn is_rushing_to_conclude(text: &str) -> bool {
+    RUSHING_PATTERNS.is_match(text)
+}
+
+/// Detects uncertainty in agent reasoning.
+pub(crate) fn has_high_uncertainty(text: &str) -> bool {
+    UNCERTAIN_PATTERNS.is_match(text)
+}
+
+/// Detects complexity avoidance patterns.
+pub(crate) fn is_avoiding_complexity(text: &str) -> bool {
+    COMPLEXITY_AVOIDANCE_PATTERNS.is_match(text)
+}
+
+/// Detects reasoning lines that announce a decision, plan, or tool call.
+///
+/// Returns `true` for lines worth emphasizing in the compact on-screen trace.
+pub(crate) fn is_decision_or_tool_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    DECISION_TOOL_PATTERNS.is_match(trimmed)
+}
+
+/// Analyzes reasoning text for multiple concern patterns.
+pub(crate) fn analyze_reasoning(text: &str) -> ReasoningAnalysis {
+    ReasoningAnalysis {
+        is_giving_up: is_giving_up_reasoning(text),
+        is_rushing: is_rushing_to_conclude(text),
+        has_uncertainty: has_high_uncertainty(text),
+        is_avoiding_complexity: is_avoiding_complexity(text),
+    }
+}
+
+/// Result of reasoning analysis with concern flags.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReasoningAnalysis {
+    pub(crate) is_giving_up: bool,
+    pub(crate) is_rushing: bool,
+    pub(crate) has_uncertainty: bool,
+    pub(crate) is_avoiding_complexity: bool,
+}
+
+impl ReasoningAnalysis {
+    pub(crate) fn has_concerns(&self) -> bool {
+        self.is_giving_up || self.is_rushing || self.has_uncertainty || self.is_avoiding_complexity
+    }
+
+    pub(crate) fn priority_concern(&self) -> Option<ReasoningConcern> {
+        if self.is_giving_up {
+            Some(ReasoningConcern::GivingUp)
+        } else if self.is_rushing {
+            Some(ReasoningConcern::Rushing)
+        } else if self.has_uncertainty {
+            Some(ReasoningConcern::Uncertainty)
+        } else if self.is_avoiding_complexity {
+            Some(ReasoningConcern::AvoidingComplexity)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReasoningConcern {
+    GivingUp,
+    Rushing,
+    Uncertainty,
+    AvoidingComplexity,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_giving_up_detection() {
+        assert!(is_giving_up_reasoning("I think we should stop here"));
+        assert!(is_giving_up_reasoning("I can't continue with this task"));
+        assert!(is_giving_up_reasoning("This is too complex"));
+        assert!(!is_giving_up_reasoning("Let me try another approach"));
+    }
+
+    #[test]
+    fn test_rushing_detection() {
+        assert!(is_rushing_to_conclude("Wrapping up now"));
+        assert!(is_rushing_to_conclude("Just to be safe, let's conclude"));
+        assert!(!is_rushing_to_conclude("Let me continue investigating"));
+    }
+
+    #[test]
+    fn test_uncertainty_detection() {
+        assert!(has_high_uncertainty("I'm not sure about this"));
+        assert!(has_high_uncertainty("This could be wrong"));
+        assert!(!has_high_uncertainty("This is the correct approach"));
+    }
+
+    #[test]
+    fn test_complexity_avoidance() {
+        assert!(is_avoiding_complexity("This is too complex"));
+        assert!(is_avoiding_complexity("Let's skip that for now"));
+        assert!(!is_avoiding_complexity("Let me tackle this step by step"));
+    }
+
+    #[test]
+    fn test_decision_or_tool_line() {
+        assert!(is_decision_or_tool_line("I will run the tests now"));
+        assert!(is_decision_or_tool_line("Let me check the config file"));
+        assert!(is_decision_or_tool_line("Step 2: refactor the parser"));
+        assert!(is_decision_or_tool_line("call the grep tool to find usages"));
+        assert!(is_decision_or_tool_line("  Next, I need to execute the migration  "));
+        assert!(!is_decision_or_tool_line("The user asked about the build system"));
+        assert!(!is_decision_or_tool_line(""));
+        assert!(!is_decision_or_tool_line("   "));
+    }
+
+    #[test]
+    fn test_analysis() {
+        let analysis = analyze_reasoning("I think we should stop here, it's too complex");
+        assert!(analysis.has_concerns());
+        assert_eq!(analysis.priority_concern(), Some(ReasoningConcern::GivingUp));
+    }
+
+    #[test]
+    fn test_analysis_no_concerns() {
+        let analysis = analyze_reasoning("Let me continue with the next step");
+        assert!(!analysis.has_concerns());
+        assert_eq!(analysis.priority_concern(), None);
+    }
+
+    #[test]
+    fn resolve_reasoning_visibility_requires_capability() {
+        let mut cfg = VTCodeConfig::default();
+        cfg.ui.reasoning_display_mode = ReasoningDisplayMode::Always;
+        cfg.ui.reasoning_visible_default = true;
+
+        assert!(!resolve_reasoning_visibility(Some(&cfg), false));
+        assert!(!resolve_reasoning_visibility(None, false));
+    }
+
+    #[test]
+    fn resolve_reasoning_visibility_honors_display_mode() {
+        let mut cfg = VTCodeConfig::default();
+
+        cfg.ui.reasoning_display_mode = ReasoningDisplayMode::Always;
+        assert!(resolve_reasoning_visibility(Some(&cfg), true));
+
+        cfg.ui.reasoning_display_mode = ReasoningDisplayMode::Hidden;
+        assert!(!resolve_reasoning_visibility(Some(&cfg), true));
+
+        cfg.ui.reasoning_display_mode = ReasoningDisplayMode::Toggle;
+        cfg.ui.reasoning_visible_default = true;
+        assert!(resolve_reasoning_visibility(Some(&cfg), true));
+
+        cfg.ui.reasoning_visible_default = false;
+        assert!(!resolve_reasoning_visibility(Some(&cfg), true));
+    }
+
+    #[test]
+    fn resolve_reasoning_visibility_defaults_to_enabled_without_config() {
+        assert!(resolve_reasoning_visibility(None, true));
+    }
+
+    #[test]
+    fn resolve_reasoning_visibility_uses_visible_default_config() {
+        let cfg = VTCodeConfig::default();
+        assert!(resolve_reasoning_visibility(Some(&cfg), true));
+    }
+}

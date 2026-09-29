@@ -1,0 +1,75 @@
+# Clippy configuration for vtcode
+# Based on best practices from https://rust-lang.github.io/rust-clippy/master/index.html
+# and grok-build patterns
+
+# Minimum supported Rust version
+msrv = "1.93.0"
+
+# Cognitive complexity threshold for functions
+cognitive-complexity-threshold = 75
+
+# Too many arguments threshold for functions
+too-many-arguments-threshold = 9
+
+# Disallow specific methods that should be avoided
+disallowed-methods = [
+    { path = "std::panic::panic_any", reason = "Use anyhow/thiserror for error handling instead" },
+    { path = "std::iter::Iterator::for_each", reason = "prefer `for` for side-effects (F-COMBINATOR)" },
+    { path = "std::iter::Iterator::try_for_each", reason = "prefer `for` for side-effects (F-COMBINATOR)" },
+    # Canonicalization: std::fs::canonicalize returns \\?\ verbatim paths on
+    # Windows, which break path comparisons and round-tripping. Use
+    # vtcode_commons::canonicalize (backed by dunce) instead. Pattern adopted
+    # from grok-build.
+    { path = "std::fs::canonicalize", reason = "returns \\\\?\\ verbatim paths on Windows; use vtcode_commons::canonicalize (dunce-backed)" },
+    { path = "std::path::Path::canonicalize", reason = "returns \\\\?\\ verbatim paths on Windows; use vtcode_commons::canonicalize (dunce-backed)" },
+    { path = "tokio::fs::canonicalize", reason = "returns \\\\?\\ verbatim paths on Windows; use vtcode_commons::fs::canonicalize_with_context_async (spawn_blocking + dunce)" },
+]
+
+# Allow absolute paths from specific crates (for project structure)
+absolute-paths-allowed-crates = [
+    "vtcode",
+    "vtcode-core",
+    "vtcode-commons",
+    "vtcode-config",
+    "vtcode-ui",
+    "vtcode-indexer",
+    "vtcode-bash-runner",
+    "vtcode-exec-events",
+    "vtcode-acp",
+    "vtcode-auth",
+    "vtcode-a2a",
+    "vtcode-mcp",
+    "vtcode-llm",
+    "vtcode-safety",
+    "vtcode-memory",
+    "vtcode-skills",
+    "vtcode-eval",
+    "vtcode-macros",
+    "vtcode-utility-tool-specs",
+]
+
+# Suppress arithmetic checks for specific types where overflow is expected
+arithmetic-side-effects-allowed = [
+    "u8", "u16", "u32", "u64", "u128", "usize",
+    "i8", "i16", "i32", "i64", "i128", "isize",
+]
+
+# Allow specific types that may have interior mutability
+ignore-interior-mutability = [
+    "std::sync::atomic::AtomicBool",
+    "std::sync::atomic::AtomicUsize",
+    "std::sync::atomic::AtomicI32",
+    "std::cell::RefCell",
+    "std::cell::Cell",
+    "parking_lot::Mutex",
+    "parking_lot::RwLock",
+    "tokio::sync::Mutex",
+    "tokio::sync::RwLock",
+]
+
+# Test-only relaxations that keep future stricter lint rollouts focused on production code.
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true

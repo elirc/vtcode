@@ -1,0 +1,1088 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use async_stream::try_stream;
+use async_trait::async_trait;
+use futures::StreamExt;
+use tokio::sync::{Notify, mpsc};
+
+use crate::agent::runloop::unified::plan_blocks::{ProposedPlanStreamParser, extract_proposed_plan};
+use crate::agent::runloop::unified::stream_sanitization::StreamSanitizer;
+use vtcode_commons::formatting::compact_reasoning_text;
+use vtcode_core::copilot::CopilotRuntimeRequest;
+use vtcode_core::llm::error_display;
+use vtcode_core::llm::provider::{self as uni, LLMStreamEvent, NormalizedStreamEvent};
+use vtcode_core::llm::providers::clean_reasoning_text;
+use vtcode_core::utils::ansi::{AnsiRenderer, MessageStyle};
+
+use super::state::CtrlCState;
+use super::ui_interaction::{PlaceholderSpinner, StreamProgressEvent, StreamSpinnerOptions};
+use super::ui_interaction_stream_helpers::{common_prefix_len, map_render_error, reasoning_matches_content};
+
+#[derive(Clone, Copy)]
+pub(crate) struct FirstProgressTimeout {
+    pub(crate) deadline: tokio::time::Instant,
+    budget: Duration,
+}
+
+impl FirstProgressTimeout {
+    pub(crate) fn starting_now(budget: Duration) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + budget,
+            budget,
+        }
+    }
+}
+
+fn first_progress_timeout_error(provider_name: &str, budget: Duration) -> uni::LLMError {
+    uni::LLMError::Provider {
+        message: error_display::format_llm_error(
+            provider_name,
+            &format!("LLM first token timed out after {} seconds", budget.as_secs()),
+        ),
+        metadata: None,
+    }
+}
+
+#[derive(Default)]
+struct StreamingReasoningState {
+    buffered: String,
+    /// Number of chars of `buffered`'s compacted form already rendered.
+    printed_chars: usize,
+    render_output: bool,
+    defer_rendering: bool,
+    rendered_any: bool,
+}
+
+impl StreamingReasoningState {
+    fn new(inline_enabled: bool) -> Self {
+        Self {
+            buffered: String::new(),
+            printed_chars: 0,
+            render_output: true,
+            defer_rendering: !inline_enabled,
+            rendered_any: false,
+        }
+    }
+
+    /// Append a reasoning delta and emit any newly-stabilized, compacted tail.
+    ///
+    /// Each chunk is printed exactly once and blank-line spam from the model is
+    /// collapsed, so the on-screen chain-of-thought stays compact. When rendering
+    /// is deferred (non-streaming), the delta is buffered and emitted at
+    /// [`Self::finalize`].
+    fn handle_delta(&mut self, renderer: &mut AnsiRenderer, delta: &str) -> Result<bool> {
+        if !self.render_output {
+            return Ok(false);
+        }
+        self.buffered.push_str(delta);
+        if self.defer_rendering {
+            return Ok(false);
+        }
+        self.render_new_tail(renderer)
+    }
+
+    /// Render the newly-stabilized tail of the compacted reasoning buffer.
+    fn render_new_tail(&mut self, renderer: &mut AnsiRenderer) -> Result<bool> {
+        if self.buffered.is_empty() {
+            return Ok(self.rendered_any);
+        }
+
+        let compact = compact_reasoning_text(&self.buffered);
+        let compact_len = compact.chars().count();
+        if self.printed_chars > compact_len {
+            self.printed_chars = compact_len;
+        }
+        let tail: String = compact.chars().skip(self.printed_chars).collect();
+        if tail.is_empty() {
+            return Ok(self.rendered_any);
+        }
+
+        let inline = renderer.writes_to_inline_sink();
+        for line in tail.split('\n') {
+            let is_blank = line.trim().is_empty();
+            if is_blank {
+                if !inline {
+                    renderer.line(MessageStyle::Reasoning, "")?;
+                }
+                // Inline sink: drop blank lines entirely to avoid blank-line spam.
+                continue;
+            }
+            let style = if super::reasoning::is_decision_or_tool_line(line) {
+                MessageStyle::ReasoningEmphasis
+            } else {
+                MessageStyle::Reasoning
+            };
+            if inline {
+                // Preserve line breaks while dropping blank-line spam: each
+                // non-blank line is streamed with a trailing newline.
+                let mut piece = String::with_capacity(line.len() + 1);
+                piece.push_str(line);
+                piece.push('\n');
+                renderer.inline_with_style(style, &piece)?;
+            } else {
+                renderer.line(style, line)?;
+            }
+        }
+        self.printed_chars = compact_len;
+        self.rendered_any = true;
+        Ok(true)
+    }
+
+    fn flush_pending(&mut self, renderer: &mut AnsiRenderer) -> Result<bool> {
+        if !self.render_output {
+            self.buffered.clear();
+            self.printed_chars = 0;
+            return Ok(false);
+        }
+        self.render_new_tail(renderer)
+    }
+
+    fn finalize(
+        &mut self,
+        renderer: &mut AnsiRenderer,
+        final_reasoning: Option<&str>,
+        reasoning_already_emitted: bool,
+        suppress_reasoning: bool,
+    ) -> Result<()> {
+        if !self.render_output {
+            self.buffered.clear();
+            self.printed_chars = 0;
+            return Ok(());
+        }
+        if suppress_reasoning {
+            self.buffered.clear();
+            self.printed_chars = 0;
+            return Ok(());
+        }
+
+        self.flush_pending(renderer)?;
+        if self.rendered_any {
+            return Ok(());
+        }
+
+        if !reasoning_already_emitted
+            && let Some(reasoning_text) = final_reasoning
+            && !reasoning_text.trim().is_empty()
+        {
+            let compact = compact_reasoning_text(reasoning_text);
+            if !compact.trim().is_empty() {
+                use crate::agent::runloop::unified::ui_interaction_stream_helpers::render_compact_reasoning_block;
+                render_compact_reasoning_block(renderer, reasoning_text)?;
+                self.rendered_any = true;
+
+                use super::reasoning::analyze_reasoning;
+                let analysis = analyze_reasoning(&compact);
+                if analysis.has_concerns() {
+                    tracing::debug!(
+                        concern = ?analysis.priority_concern(),
+                        "Reasoning concern detected in CoT output"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_stream_failure(&mut self, _renderer: &mut AnsiRenderer) -> Result<()> {
+        self.buffered.clear();
+        Ok(())
+    }
+
+    fn rendered_reasoning(&self) -> bool {
+        self.rendered_any
+    }
+
+    fn is_deferred(&self) -> bool {
+        self.defer_rendering
+    }
+}
+
+fn flush_pending_reasoning_delta(
+    provider_name: &str,
+    renderer: &mut AnsiRenderer,
+    reasoning_state: &mut StreamingReasoningState,
+    on_progress: &mut Option<&mut (dyn FnMut(StreamProgressEvent) + Send)>,
+    pending_delta: &mut String,
+) -> Result<bool, uni::LLMError> {
+    if pending_delta.is_empty() {
+        return Ok(false);
+    }
+
+    let delta = std::mem::take(pending_delta);
+    if let Some(callback) = on_progress.as_deref_mut() {
+        callback(StreamProgressEvent::ReasoningDelta(delta.clone()));
+    }
+
+    reasoning_state
+        .handle_delta(renderer, &delta)
+        .map_err(|err| map_render_error(provider_name, err))
+}
+
+fn flush_pending_reasoning(
+    provider_name: &str,
+    renderer: &mut AnsiRenderer,
+    reasoning_state: &mut StreamingReasoningState,
+    on_progress: &mut Option<&mut (dyn FnMut(StreamProgressEvent) + Send)>,
+    pending_delta: &mut String,
+    pending_render_bytes: &mut usize,
+    last_render_at: &mut Instant,
+    reasoning_emitted: &mut bool,
+) -> Result<(), uni::LLMError> {
+    let rendered = flush_pending_reasoning_delta(provider_name, renderer, reasoning_state, on_progress, pending_delta)?;
+    if rendered {
+        *reasoning_emitted = true;
+    }
+    *pending_render_bytes = 0;
+    *last_render_at = Instant::now();
+    Ok(())
+}
+
+fn stream_markdown_with_provider_error(
+    provider_name: &str,
+    renderer: &mut AnsiRenderer,
+    text: &str,
+    previous_line_count: usize,
+) -> Result<usize, uni::LLMError> {
+    renderer
+        .stream_markdown_response(text, previous_line_count)
+        .map_err(|err| map_render_error(provider_name, err))
+}
+
+// Provider-noise and harmony-control-token sanitization has been extracted to
+// `stream_sanitization::StreamSanitizer`. The constants and helper functions
+// that previously lived here (`HARMONY_MARKERS`, `contains_harmony_marker`,
+// `sanitize_harmony_stream_text`, `sanitize_harmony_final_text`, etc.) now
+// reside in that module, alongside MiniMax flat-noise stripping.
+
+#[async_trait]
+pub(crate) trait CopilotRuntimeRequestHandler: Send {
+    async fn handle_runtime_request(
+        &mut self,
+        renderer: &mut AnsiRenderer,
+        request: CopilotRuntimeRequest,
+    ) -> Result<(), uni::LLMError>;
+}
+
+fn normalized_to_legacy_stream(
+    mut stream: uni::LLMNormalizedStream,
+) -> (uni::LLMStream, mpsc::Receiver<StreamProgressEvent>) {
+    let (progress_tx, progress_rx) = mpsc::channel(256);
+    let stream = try_stream! {
+        let mut pending_usage = None;
+
+        while let Some(event) = stream.next().await {
+            match event? {
+                NormalizedStreamEvent::TextDelta { delta } => {
+                    yield LLMStreamEvent::Token { delta };
+                }
+                NormalizedStreamEvent::ReasoningDelta { delta } => {
+                    yield LLMStreamEvent::Reasoning { delta };
+                }
+                NormalizedStreamEvent::ToolCallStart { call_id, name } => {
+                    let _ = progress_tx.send(StreamProgressEvent::ToolCallStarted { call_id, name }).await;
+                }
+                NormalizedStreamEvent::ToolCallDelta { call_id, delta } => {
+                    let _ = progress_tx.send(StreamProgressEvent::ToolCallDelta { call_id, delta }).await;
+                }
+                NormalizedStreamEvent::Usage { usage } => {
+                    pending_usage = Some(usage);
+                }
+                NormalizedStreamEvent::Done { response } => {
+                    let mut response = *response;
+                    if response.usage.is_none() {
+                        response.usage = pending_usage.take();
+                    }
+                    yield LLMStreamEvent::Completed {
+                        response: Box::new(response),
+                    };
+                }
+            }
+        }
+    };
+
+    (Box::pin(stream), progress_rx)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_and_render_response_with_options_impl(
+    provider: &dyn uni::LLMProvider,
+    request: uni::LLMRequest,
+    spinner: &PlaceholderSpinner,
+    renderer: &mut AnsiRenderer,
+    ctrl_c_state: &Arc<CtrlCState>,
+    ctrl_c_notify: &Arc<Notify>,
+    options: StreamSpinnerOptions,
+    on_progress: Option<&mut (dyn FnMut(StreamProgressEvent) + Send)>,
+) -> Result<(uni::LLMResponse, bool), uni::LLMError> {
+    stream_and_render_response_with_options_impl_first_progress_timeout(
+        provider,
+        request,
+        None,
+        spinner,
+        renderer,
+        ctrl_c_state,
+        ctrl_c_notify,
+        options,
+        on_progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_and_render_response_with_options_impl_first_progress_timeout(
+    provider: &dyn uni::LLMProvider,
+    request: uni::LLMRequest,
+    first_progress_timeout: Option<Duration>,
+    spinner: &PlaceholderSpinner,
+    renderer: &mut AnsiRenderer,
+    ctrl_c_state: &Arc<CtrlCState>,
+    ctrl_c_notify: &Arc<Notify>,
+    options: StreamSpinnerOptions,
+    on_progress: Option<&mut (dyn FnMut(StreamProgressEvent) + Send)>,
+) -> Result<(uni::LLMResponse, bool), uni::LLMError> {
+    let provider_name = provider.name();
+
+    if ctrl_c_state.is_cancel_requested() {
+        spinner.finish_with_restore(true);
+        return Err(uni::LLMError::Provider {
+            message: error_display::format_llm_error(provider_name, "Interrupted by user"),
+            metadata: None,
+        });
+    }
+
+    let stream_future = provider.stream_normalized(request);
+    tokio::pin!(stream_future);
+    let first_progress_timeout = first_progress_timeout.map(FirstProgressTimeout::starting_now);
+
+    if ctrl_c_state.is_cancel_requested() || ctrl_c_state.is_exit_requested() {
+        spinner.finish_with_restore(true);
+        return Err(uni::LLMError::Provider {
+            message: error_display::format_llm_error(provider_name, "Interrupted by user"),
+            metadata: None,
+        });
+    }
+
+    let normalized_stream = tokio::select! {
+        biased;
+        _ = ctrl_c_notify.notified() => {
+            spinner.finish_with_restore(true);
+            return Err(uni::LLMError::Provider { message: error_display::format_llm_error(provider_name, "Interrupted by user"), metadata: None });
+        }
+        _ = async {
+            match first_progress_timeout {
+                Some(timeout) => tokio::time::sleep_until(timeout.deadline).await,
+                None => std::future::pending().await,
+            }
+        } => {
+            spinner.finish_with_restore(true);
+            return Err(first_progress_timeout_error(
+                provider_name,
+                first_progress_timeout.map_or(Duration::ZERO, |timeout| timeout.budget),
+            ));
+        }
+        result = stream_future => result?,
+    };
+    let (mut stream, mut progress_events) = normalized_to_legacy_stream(normalized_stream);
+
+    render_stream_with_options_and_progress_impl(
+        provider_name,
+        &mut stream,
+        Some(&mut progress_events),
+        first_progress_timeout,
+        spinner,
+        renderer,
+        ctrl_c_state,
+        ctrl_c_notify,
+        options,
+        on_progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn render_stream_with_options_and_progress_impl(
+    provider_name: &str,
+    stream: &mut uni::BorrowedLLMStream<'_>,
+    progress_events: Option<&mut mpsc::Receiver<StreamProgressEvent>>,
+    first_progress_timeout: Option<FirstProgressTimeout>,
+    spinner: &PlaceholderSpinner,
+    renderer: &mut AnsiRenderer,
+    ctrl_c_state: &Arc<CtrlCState>,
+    ctrl_c_notify: &Arc<Notify>,
+    options: StreamSpinnerOptions,
+    on_progress: Option<&mut (dyn FnMut(StreamProgressEvent) + Send)>,
+) -> Result<(uni::LLMResponse, bool), uni::LLMError> {
+    render_stream_with_options_and_copilot_runtime_impl(
+        provider_name,
+        stream,
+        progress_events,
+        None,
+        None,
+        first_progress_timeout,
+        spinner,
+        renderer,
+        ctrl_c_state,
+        ctrl_c_notify,
+        options,
+        on_progress,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn render_stream_with_options_and_copilot_runtime_impl(
+    provider_name: &str,
+    stream: &mut uni::BorrowedLLMStream<'_>,
+    progress_events: Option<&mut mpsc::Receiver<StreamProgressEvent>>,
+    runtime_requests: Option<&mut mpsc::UnboundedReceiver<CopilotRuntimeRequest>>,
+    mut runtime_handler: Option<&mut dyn CopilotRuntimeRequestHandler>,
+    first_progress_timeout: Option<FirstProgressTimeout>,
+    spinner: &PlaceholderSpinner,
+    renderer: &mut AnsiRenderer,
+    ctrl_c_state: &Arc<CtrlCState>,
+    ctrl_c_notify: &Arc<Notify>,
+    options: StreamSpinnerOptions,
+    mut on_progress: Option<&mut (dyn FnMut(StreamProgressEvent) + Send)>,
+) -> Result<(uni::LLMResponse, bool), uni::LLMError> {
+    if ctrl_c_state.is_cancel_requested() {
+        spinner.finish_with_restore(true);
+        return Err(uni::LLMError::Provider {
+            message: error_display::format_llm_error(provider_name, "Interrupted by user"),
+            metadata: None,
+        });
+    }
+
+    let supports_streaming_markdown = renderer.supports_streaming_markdown();
+    let stream_reasoning_deltas = supports_streaming_markdown && renderer.reasoning_visible();
+    let mut final_response: Option<uni::LLMResponse> = None;
+    let mut aggregated = String::new();
+    let mut spinner_active = true;
+    let mut progress_events = progress_events;
+    let mut runtime_requests = runtime_requests;
+    let mut rendered_line_count = 0usize;
+    let finish_spinner = |active: &mut bool, force: bool| {
+        if *active {
+            if force {
+                spinner.finish_with_restore(true);
+                *active = false;
+            } else if !options.defer_finish {
+                spinner.finish();
+                *active = false;
+            }
+        }
+    };
+    let mut emitted_tokens = false;
+    let mut reasoning_state = StreamingReasoningState::new(stream_reasoning_deltas);
+    let mut spinner_message_updated = false;
+    let mut reasoning_accumulated = String::new();
+    let mut pending_content = String::new();
+    let mut content_suppressed = false;
+    const MAX_PENDING_CONTENT_BYTES: usize = 4_096;
+    const STREAM_RENDER_MIN_INTERVAL: Duration = Duration::from_millis(16);
+    const STREAM_RENDER_MAX_BYTES: usize = 384;
+    const REASONING_RENDER_MAX_BYTES: usize = 256;
+    let mut pending_render_bytes = 0usize;
+    let mut last_render_at = Instant::now();
+    let mut pending_reasoning_delta = String::new();
+    let mut pending_reasoning_render_bytes = 0usize;
+    let mut last_reasoning_render_at = Instant::now();
+
+    let mut suppress_reasoning_due_to_duplication = false;
+    let mut plan_parser = options.strip_proposed_plan_blocks.then(ProposedPlanStreamParser::new);
+
+    let mut token_count = 0;
+    let mut reasoning_token_count = 0;
+    let mut last_progress_update = Instant::now();
+    let mut reasoning_emitted = false;
+    let mut stream_sanitizer = StreamSanitizer::new();
+    let mut first_progress_timeout = first_progress_timeout;
+
+    loop {
+        if ctrl_c_state.is_cancel_requested() || ctrl_c_state.is_exit_requested() {
+            finish_spinner(&mut spinner_active, true);
+            reasoning_state
+                .handle_stream_failure(renderer)
+                .map_err(|err| map_render_error(provider_name, err))?;
+            return Err(uni::LLMError::Provider {
+                message: error_display::format_llm_error(provider_name, "Interrupted by user"),
+                metadata: None,
+            });
+        }
+
+        let maybe_event = tokio::select! {
+            biased;
+            _ = ctrl_c_notify.notified() => {
+                finish_spinner(&mut spinner_active, true);
+                reasoning_state
+                    .handle_stream_failure(renderer)
+                    .map_err(|err| map_render_error(provider_name, err))?;
+                return Err(uni::LLMError::Provider { message: error_display::format_llm_error(provider_name, "Interrupted by user"), metadata: None });
+            }
+            _ = async {
+                match first_progress_timeout {
+                    Some(timeout) => tokio::time::sleep_until(timeout.deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                finish_spinner(&mut spinner_active, true);
+                reasoning_state
+                    .handle_stream_failure(renderer)
+                    .map_err(|err| map_render_error(provider_name, err))?;
+                return Err(first_progress_timeout_error(
+                    provider_name,
+                    first_progress_timeout.map_or(Duration::ZERO, |timeout| timeout.budget),
+                ));
+            }
+            request = async {
+                match runtime_requests.as_deref_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match request {
+                    Some(request) => {
+                        first_progress_timeout = None;
+                        finish_spinner(&mut spinner_active, true);
+                        let Some(handler) = runtime_handler.as_deref_mut() else {
+                            return Err(uni::LLMError::Provider {
+                                message: error_display::format_llm_error(
+                                    provider_name,
+                                    "Copilot runtime request arrived without a VT Code handler",
+                                ),
+                                metadata: None,
+                            });
+                        };
+                        handler.handle_runtime_request(renderer, request).await?;
+                        continue;
+                    }
+                    None => {
+                        runtime_requests = None;
+                        continue;
+                    }
+                }
+            }
+            progress_event = async {
+                match progress_events.as_deref_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match progress_event {
+                    Some(StreamProgressEvent::ToolCallStarted { call_id, name }) => {
+                        first_progress_timeout = None;
+                        finish_spinner(&mut spinner_active, false);
+                        if let Some(tool_name) = name.as_deref().filter(|value| !value.is_empty()) {
+                            spinner.update_message(format!("Preparing tool call: {tool_name}"));
+                            spinner_message_updated = true;
+                        }
+                        if let Some(callback) = on_progress.as_deref_mut() {
+                            callback(StreamProgressEvent::ToolCallStarted { call_id, name });
+                        }
+                        continue;
+                    }
+                    Some(StreamProgressEvent::ToolCallDelta { call_id, delta }) => {
+                        first_progress_timeout = None;
+                        if let Some(callback) = on_progress.as_deref_mut() {
+                            callback(StreamProgressEvent::ToolCallDelta { call_id, delta });
+                        }
+                        continue;
+                    }
+                    Some(
+                        StreamProgressEvent::OutputDelta(_)
+                        | StreamProgressEvent::ReasoningDelta(_)
+                        | StreamProgressEvent::ReasoningStage(_),
+                    ) => {
+                        first_progress_timeout = None;
+                        continue;
+                    }
+                    None => {
+                        progress_events = None;
+                        continue;
+                    }
+                }
+            }
+            event = stream.next() => event,
+        };
+
+        let Some(event_result) = maybe_event else {
+            break;
+        };
+
+        match event_result {
+            Ok(LLMStreamEvent::Token { delta }) => {
+                first_progress_timeout = None;
+                token_count += 1;
+                let mut visible_delta = if let Some(parser) = plan_parser.as_mut() {
+                    parser.consume(&delta)
+                } else {
+                    delta
+                };
+
+                let sanitized = stream_sanitizer.process_delta(&visible_delta);
+                visible_delta = sanitized.visible_delta;
+                let has_aggregated_override = sanitized.aggregated_override.is_some();
+                if let Some(cleaned_aggregated) = sanitized.aggregated_override {
+                    aggregated = cleaned_aggregated;
+                }
+
+                if stream_reasoning_deltas && !pending_reasoning_delta.is_empty() {
+                    flush_pending_reasoning(
+                        provider_name,
+                        renderer,
+                        &mut reasoning_state,
+                        &mut on_progress,
+                        &mut pending_reasoning_delta,
+                        &mut pending_reasoning_render_bytes,
+                        &mut last_reasoning_render_at,
+                        &mut reasoning_emitted,
+                    )?;
+                }
+                if !reasoning_emitted && reasoning_token_count > 0 && !reasoning_state.is_deferred() {
+                    let rendered = reasoning_state
+                        .flush_pending(renderer)
+                        .map_err(|err| map_render_error(provider_name, err))?;
+                    if rendered {
+                        reasoning_emitted = true;
+                    }
+                }
+
+                if !spinner_message_updated {
+                    spinner.update_message("Receiving response...");
+                    spinner_message_updated = true;
+                } else if last_progress_update.elapsed() >= Duration::from_millis(500) {
+                    spinner.update_message(format!("Receiving response... ({token_count} tokens)"));
+                    last_progress_update = Instant::now();
+                }
+                finish_spinner(&mut spinner_active, false);
+                if visible_delta.is_empty() {
+                    continue;
+                }
+                if let Some(callback) = on_progress.as_deref_mut() {
+                    callback(StreamProgressEvent::OutputDelta(visible_delta.clone()));
+                }
+                if !supports_streaming_markdown && !reasoning_accumulated.trim().is_empty() && !emitted_tokens {
+                    pending_content.push_str(&visible_delta);
+                    if pending_content.len() >= MAX_PENDING_CONTENT_BYTES {
+                        aggregated.push_str(&pending_content);
+                        pending_content.clear();
+                    }
+                    continue;
+                }
+
+                if !has_aggregated_override {
+                    aggregated.push_str(&visible_delta);
+                }
+                if supports_streaming_markdown {
+                    pending_render_bytes = pending_render_bytes.saturating_add(visible_delta.len());
+                    let should_render_now = !emitted_tokens
+                        || visible_delta.contains('\n')
+                        || pending_render_bytes >= STREAM_RENDER_MAX_BYTES
+                        || last_render_at.elapsed() >= STREAM_RENDER_MIN_INTERVAL;
+                    if should_render_now {
+                        rendered_line_count = stream_markdown_with_provider_error(
+                            provider_name,
+                            renderer,
+                            &aggregated,
+                            rendered_line_count,
+                        )?;
+                        emitted_tokens = true;
+                        pending_render_bytes = 0;
+                        last_render_at = Instant::now();
+                    }
+                }
+            }
+            Ok(LLMStreamEvent::Reasoning { delta }) => {
+                first_progress_timeout = None;
+                reasoning_token_count += 1;
+                if !spinner_message_updated {
+                    spinner.update_message("Processing reasoning...");
+                    spinner_message_updated = true;
+                } else if last_progress_update.elapsed() >= Duration::from_millis(500) {
+                    spinner.update_message(format!("Processing reasoning... ({reasoning_token_count} tokens)"));
+                    last_progress_update = Instant::now();
+                }
+                finish_spinner(&mut spinner_active, false);
+                reasoning_accumulated.push_str(&delta);
+                if stream_reasoning_deltas {
+                    pending_reasoning_delta.push_str(&delta);
+                    pending_reasoning_render_bytes = pending_reasoning_render_bytes.saturating_add(delta.len());
+                    let should_render_now = !reasoning_emitted
+                        || delta.contains('\n')
+                        || pending_reasoning_render_bytes >= REASONING_RENDER_MAX_BYTES
+                        || last_reasoning_render_at.elapsed() >= STREAM_RENDER_MIN_INTERVAL;
+                    if should_render_now {
+                        flush_pending_reasoning(
+                            provider_name,
+                            renderer,
+                            &mut reasoning_state,
+                            &mut on_progress,
+                            &mut pending_reasoning_delta,
+                            &mut pending_reasoning_render_bytes,
+                            &mut last_reasoning_render_at,
+                            &mut reasoning_emitted,
+                        )?;
+                    }
+                }
+            }
+            Ok(LLMStreamEvent::ReasoningStage { stage }) => {
+                first_progress_timeout = None;
+                if stream_reasoning_deltas && !pending_reasoning_delta.is_empty() {
+                    flush_pending_reasoning(
+                        provider_name,
+                        renderer,
+                        &mut reasoning_state,
+                        &mut on_progress,
+                        &mut pending_reasoning_delta,
+                        &mut pending_reasoning_render_bytes,
+                        &mut last_reasoning_render_at,
+                        &mut reasoning_emitted,
+                    )?;
+                }
+                if stream_reasoning_deltas {
+                    if let Some(callback) = on_progress.as_deref_mut() {
+                        callback(StreamProgressEvent::ReasoningStage(stage.clone()));
+                    }
+                    spinner.set_reasoning_stage(Some(stage));
+                }
+            }
+            Ok(LLMStreamEvent::ReasoningSignature { .. }) => {
+                // Signature field not currently processed in UI stream
+            }
+            Ok(LLMStreamEvent::Completed { response }) => {
+                final_response = Some(*response);
+            }
+            Err(err) => {
+                finish_spinner(&mut spinner_active, true);
+                reasoning_state
+                    .handle_stream_failure(renderer)
+                    .map_err(|render_err| map_render_error(provider_name, render_err))?;
+                return Err(err);
+            }
+        }
+    }
+
+    finish_spinner(&mut spinner_active, false);
+
+    if stream_reasoning_deltas && !pending_reasoning_delta.is_empty() {
+        let rendered = flush_pending_reasoning_delta(
+            provider_name,
+            renderer,
+            &mut reasoning_state,
+            &mut on_progress,
+            &mut pending_reasoning_delta,
+        )?;
+        if rendered {
+            reasoning_emitted = true;
+        }
+    }
+
+    if let Some(parser) = plan_parser.as_mut() {
+        let trailing_plan_parse = parser.finish();
+        if !trailing_plan_parse.stripped_text.is_empty() {
+            if let Some(callback) = on_progress {
+                callback(StreamProgressEvent::OutputDelta(trailing_plan_parse.stripped_text.clone()));
+            }
+            if !supports_streaming_markdown && !reasoning_accumulated.trim().is_empty() && !emitted_tokens {
+                pending_content.push_str(&trailing_plan_parse.stripped_text);
+                if pending_content.len() >= MAX_PENDING_CONTENT_BYTES {
+                    aggregated.push_str(&pending_content);
+                    pending_content.clear();
+                }
+            } else {
+                aggregated.push_str(&trailing_plan_parse.stripped_text);
+                if supports_streaming_markdown {
+                    rendered_line_count =
+                        stream_markdown_with_provider_error(provider_name, renderer, &aggregated, rendered_line_count)?;
+                    emitted_tokens = true;
+                }
+            }
+        }
+    }
+
+    if supports_streaming_markdown && pending_render_bytes > 0 {
+        rendered_line_count =
+            stream_markdown_with_provider_error(provider_name, renderer, &aggregated, rendered_line_count)?;
+        emitted_tokens = true;
+    }
+
+    let response = match final_response {
+        Some(response) => response,
+        None => {
+            reasoning_state
+                .handle_stream_failure(renderer)
+                .map_err(|err| map_render_error(provider_name, err))?;
+            finish_spinner(&mut spinner_active, true);
+            let formatted_error =
+                error_display::format_llm_error(provider_name, "Stream ended without a completion event");
+            return Err(uni::LLMError::Provider { message: formatted_error, metadata: None });
+        }
+    };
+
+    if !pending_content.is_empty() && !content_suppressed {
+        let reasoning_for_compare = response.reasoning.as_deref().unwrap_or(reasoning_accumulated.as_str());
+        if !reasoning_for_compare.trim().is_empty()
+            && reasoning_matches_content(reasoning_for_compare, &pending_content)
+        {
+            suppress_reasoning_due_to_duplication = true;
+        }
+    }
+
+    if !pending_content.is_empty() && !content_suppressed {
+        let prefix_len = common_prefix_len(&reasoning_accumulated, &pending_content);
+        let reasoning_prefix = !reasoning_accumulated.is_empty() && prefix_len == reasoning_accumulated.len();
+        let pending = std::mem::take(&mut pending_content);
+        let render_text = if reasoning_prefix {
+            pending.get(prefix_len..).unwrap_or("").to_string()
+        } else {
+            pending
+        };
+
+        if reasoning_prefix && render_text.is_empty() && (reasoning_state.rendered_reasoning() || reasoning_emitted) {
+            content_suppressed = true;
+        } else {
+            aggregated.push_str(&render_text);
+            if supports_streaming_markdown {
+                let prev_count = if aggregated.trim().is_empty() {
+                    0
+                } else {
+                    rendered_line_count
+                };
+                let _ = stream_markdown_with_provider_error(provider_name, renderer, &aggregated, prev_count)?;
+                emitted_tokens = true;
+            }
+            if reasoning_prefix && (reasoning_state.rendered_reasoning() || reasoning_emitted) {
+                content_suppressed = true;
+            }
+        }
+    }
+
+    let content_for_render = if options.strip_proposed_plan_blocks {
+        response
+            .content
+            .as_deref()
+            .map(extract_proposed_plan)
+            .map(|extraction| extraction.stripped_text)
+    } else {
+        response.content.clone()
+    };
+    let content_for_render = content_for_render.map(|text| stream_sanitizer.finalize(&text));
+    let has_renderable_content = content_for_render
+        .as_deref()
+        .map(|content| !content.trim().is_empty())
+        .unwrap_or(false);
+
+    if !content_suppressed && let Some(content) = content_for_render.as_deref() {
+        let content_trimmed = content.trim();
+        if !content_trimmed.is_empty() {
+            let reasoning_dupes_content = response
+                .reasoning
+                .as_deref()
+                .map(|reasoning| reasoning_matches_content(reasoning, content))
+                .unwrap_or(false);
+
+            if reasoning_dupes_content {
+                suppress_reasoning_due_to_duplication = true;
+            }
+
+            let already_rendered = supports_streaming_markdown
+                && emitted_tokens
+                && !aggregated.trim().is_empty()
+                && aggregated.trim() == content_trimmed;
+
+            reasoning_state
+                .finalize(
+                    renderer,
+                    response.reasoning.as_deref(),
+                    reasoning_emitted,
+                    suppress_reasoning_due_to_duplication,
+                )
+                .map_err(|err| map_render_error(provider_name, err))?;
+
+            if !already_rendered {
+                if supports_streaming_markdown {
+                    let prev_count = if aggregated.trim().is_empty() {
+                        0
+                    } else {
+                        rendered_line_count
+                    };
+                    let _ = stream_markdown_with_provider_error(provider_name, renderer, content, prev_count)?;
+                } else {
+                    renderer
+                        .line(MessageStyle::Response, content)
+                        .map_err(|err| map_render_error(provider_name, err))?;
+                }
+                emitted_tokens = true;
+                aggregated = content.to_string();
+            }
+        }
+    }
+
+    let rendered_reasoning_before = reasoning_state.rendered_reasoning();
+    if !has_renderable_content || aggregated.trim().is_empty() || suppress_reasoning_due_to_duplication {
+        let suppress_reasoning = suppress_reasoning_due_to_duplication;
+        reasoning_state
+            .finalize(renderer, response.reasoning.as_deref(), reasoning_emitted, suppress_reasoning)
+            .map_err(|err| map_render_error(provider_name, err))?;
+    }
+
+    if !emitted_tokens
+        && aggregated.trim().is_empty()
+        && !has_renderable_content
+        && !rendered_reasoning_before
+        && renderer.reasoning_visible()
+        && let Some(reasoning) = response.reasoning.as_deref()
+    {
+        let reasoning_trimmed = clean_reasoning_text(reasoning.trim());
+        if !reasoning_trimmed.is_empty() {
+            if supports_streaming_markdown {
+                let _ = stream_markdown_with_provider_error(provider_name, renderer, &reasoning_trimmed, 0)?;
+            } else {
+                renderer
+                    .line(MessageStyle::Response, &reasoning_trimmed)
+                    .map_err(|err| map_render_error(provider_name, err))?;
+            }
+            emitted_tokens = true;
+        }
+    }
+
+    let response_rendered = emitted_tokens || reasoning_emitted || reasoning_state.rendered_reasoning();
+
+    Ok((response, response_rendered))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CopilotRuntimeRequestHandler, FirstProgressTimeout, render_stream_with_options_and_copilot_runtime_impl,
+    };
+    use crate::agent::runloop::unified::state::CtrlCState;
+    use crate::agent::runloop::unified::ui_interaction::{PlaceholderSpinner, StreamSpinnerOptions};
+    use async_trait::async_trait;
+    use futures::stream;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{Notify, mpsc};
+    use vtcode_core::copilot::{CopilotObservedToolCall, CopilotObservedToolCallStatus, CopilotRuntimeRequest};
+    use vtcode_core::llm::provider::{self as uni, FinishReason, LLMResponse, LLMStreamEvent};
+    use vtcode_core::utils::ansi::AnsiRenderer;
+    use vtcode_ui::tui::app::{InlineCommand, InlineHandle};
+
+    struct SleepingRuntimeHandler {
+        sleep_for: Duration,
+    }
+
+    #[async_trait]
+    impl CopilotRuntimeRequestHandler for SleepingRuntimeHandler {
+        async fn handle_runtime_request(
+            &mut self,
+            _renderer: &mut AnsiRenderer,
+            _request: CopilotRuntimeRequest,
+        ) -> Result<(), uni::LLMError> {
+            tokio::time::sleep(self.sleep_for).await;
+            Ok(())
+        }
+    }
+
+    fn build_spinner() -> PlaceholderSpinner {
+        let (tx, _rx) = mpsc::unbounded_channel::<InlineCommand>();
+        let handle = InlineHandle::new_for_tests(tx);
+        PlaceholderSpinner::new(&handle, None, None, "")
+    }
+
+    fn completed_response(content: &str) -> LLMResponse {
+        LLMResponse {
+            content: Some(content.to_string()),
+            model: "mock-model".to_string(),
+            tool_calls: None,
+            usage: None,
+            finish_reason: FinishReason::Stop,
+            reasoning: None,
+            reasoning_details: None,
+            organization_id: None,
+            request_id: None,
+            tool_references: vec![],
+            compaction: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn copilot_runtime_request_counts_as_first_progress() {
+        let spinner = build_spinner();
+        let mut renderer = AnsiRenderer::stdout();
+        let ctrl_c_state = Arc::new(CtrlCState::new());
+        let ctrl_c_notify = Arc::new(Notify::new());
+
+        let mut stream: uni::LLMStream = Box::pin(stream::once(async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(LLMStreamEvent::Completed { response: Box::new(completed_response("ok")) })
+        }));
+
+        let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
+        runtime_tx
+            .send(CopilotRuntimeRequest::ObservedToolCall(CopilotObservedToolCall {
+                tool_call_id: "call_1".to_string(),
+                tool_name: "copilot_tool".to_string(),
+                status: CopilotObservedToolCallStatus::Pending,
+                arguments: None,
+                output: None,
+                terminal_id: None,
+            }))
+            .expect("send runtime request");
+        drop(runtime_tx);
+
+        let mut handler = SleepingRuntimeHandler { sleep_for: Duration::from_millis(40) };
+
+        let result = render_stream_with_options_and_copilot_runtime_impl(
+            "copilot",
+            &mut stream,
+            None,
+            Some(&mut runtime_rx),
+            Some(&mut handler),
+            Some(FirstProgressTimeout::starting_now(Duration::from_millis(20))),
+            &spinner,
+            &mut renderer,
+            &ctrl_c_state,
+            &ctrl_c_notify,
+            StreamSpinnerOptions::default(),
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "runtime request should clear the first-progress timeout");
+    }
+
+    #[tokio::test]
+    async fn stream_times_out_before_first_progress() {
+        let spinner = build_spinner();
+        let mut renderer = AnsiRenderer::stdout();
+        let ctrl_c_state = Arc::new(CtrlCState::new());
+        let ctrl_c_notify = Arc::new(Notify::new());
+
+        let mut stream: uni::LLMStream = Box::pin(stream::once(async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Ok(LLMStreamEvent::Completed { response: Box::new(completed_response("ok")) })
+        }));
+
+        let result = render_stream_with_options_and_copilot_runtime_impl(
+            "mock",
+            &mut stream,
+            None,
+            None,
+            None,
+            Some(FirstProgressTimeout::starting_now(Duration::from_millis(5))),
+            &spinner,
+            &mut renderer,
+            &ctrl_c_state,
+            &ctrl_c_notify,
+            StreamSpinnerOptions::default(),
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("stream should time out before first progress");
+        assert!(err.to_string().contains("first token timed out"));
+    }
+}

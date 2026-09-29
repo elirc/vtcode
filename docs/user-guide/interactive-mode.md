@@ -1,0 +1,237 @@
+# Interactive Mode Reference
+
+The VT Code terminal UI includes an interactive mode that combines keyboard-first navigation with quick commands for agent control. This page consolidates the shortcuts, input modes, and background execution behaviors available while you are connected to a session.
+
+## Keyboard Shortcuts
+
+> Keyboard shortcuts may vary slightly by platform and terminal emulator. Press `?` on an empty input line while VT Code is running to open a quick shortcut overlay.
+
+### General Controls
+
+| Shortcut                                    | Description                                                                     | Context                                                                                                                                   |
+| :------------------------------------------ | :------------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ctrl+C`                                    | Cancel the current generation or command. Press twice to terminate the session. | Works during prompts, tool execution, and streaming replies.                                                                              |
+| `Ctrl+D`                                    | Exit VT Code interactive mode.                                                  | Sends EOF to the shell integration.                                                                                                       |
+| `Ctrl+L`                                    | Clear the terminal screen while keeping the conversation history.               | Useful for refreshing when output is cluttered.                                                                                           |
+| `Ctrl+T`                                    | Toggle verbose tool output and diagnostics.                                     | Reveals detailed tool invocation logs without affecting the TODO panel.                                                                   |
+| `Ctrl+O`                                    | Copy last agent response as markdown to clipboard.                              | Available after the agent has produced at least one response.                                                                             |
+| `Alt+O`                                     | Open or close fullscreen transcript review.                                     | Available when VT Code is using alternate-screen rendering.                                                                               |
+| `Ctrl+A`                                    | Move cursor to start of input line.                                             | UNIX/readline-style editing.                                                                                                              |
+| `Ctrl+E`                                    | Move cursor to end of input line (or open external editor when input is empty). | Uses `tools.editor` config, then `VISUAL`/`EDITOR`. Configure it with `/config tools.editor`.                                             |
+| `Ctrl+Home`                                 | Jump to the oldest visible transcript content.                                  | Fullscreen rendering only.                                                                                                                |
+| `Ctrl+End`                                  | Jump back to the latest transcript content and resume follow mode.              | Fullscreen rendering only.                                                                                                                |
+| `Ctrl+W`                                    | Delete the previous word.                                                       | UNIX/readline-style editing.                                                                                                              |
+| `Ctrl+U`                                    | Delete from cursor to line start.                                               | UNIX/readline-style editing.                                                                                                              |
+| `Ctrl+K`                                    | Delete from cursor to line end.                                                 | UNIX/readline-style editing.                                                                                                              |
+| `Alt+Left/Right`                            | Move cursor by word.                                                            | UNIX/readline-style navigation.                                                                                                           |
+| `Ctrl+R`                                    | Reverse search the command history.                                             | Matches previous prompts and bash commands.                                                                                               |
+| `Ctrl+V` or `Alt+V`                         | Paste a clipboard image through VT Code.                                        | App-level shortcut; works only in image-enabled sessions. Use your terminal's paste shortcut for text.                                     |
+| `Ctrl+Z` (Unix)                             | Suspend VT Code to the shell; run `fg` to resume.                               | Job-control support for terminal workflows.                                                                                               |
+| `Up/Down arrows`                            | Navigate through command history.                                               | Recall previous prompts or commands.                                                                                                      |
+| `Esc` + `Esc`                               | Open the rewind picker for checkpoint restore or summarize actions.             | Idle context only (while no task/PTY is running).                                                                                         |
+| `Enter`                                     | Queue the current input.                                                        | Plain input box only.                                                                                                                     |
+| `Tab`                                       | Accept the visible inline suggestion; on an empty idle composer, cycle primary agents; otherwise queue the current input. | Plain input box only. Disabled while a turn is processing (shows a notice). |
+| `Ctrl+Enter`                                | Process now or steer now.                                                       | Idle: runs the current draft, or the newest queued message if the draft is empty. Active: steers the current turn with the current draft. |
+| `Shift+Tab` or `Alt+M`                      | Cycle primary agents.                                                           | Switches between available main-session agents. Disabled while a turn is processing (shows a notice). |
+
+### Multiline Input
+
+| Method               | Shortcut       | Context                                                                                           |
+| :------------------- | :------------- | :------------------------------------------------------------------------------------------------ |
+| Quick escape         | `\` + `Enter`  | Works across supported terminals.                                                                 |
+| macOS default        | `Option+Enter` | Default multiline binding on macOS terminals.                                                     |
+| Native or configured | `Shift+Enter`  | Works natively in some terminals and is available after `/terminal-setup` in supported terminals. |
+| Control sequence     | `Ctrl+J`       | Inserts a line feed for multiline editing.                                                        |
+| Paste mode           | Paste directly | Ideal for code blocks or long transcripts.                                                        |
+
+> Tip: `Shift+Enter` works natively in `Ghostty`, `Kitty`, `WezTerm`, `iTerm2`, and `Warp`. Run `/terminal-setup` in supported terminals such as `VS Code`, `Alacritty`, or `Zed` when you want VT Code's guided setup flow.
+
+### Clipboard Paste
+
+- `Ctrl+V` and `Alt+V` are VT Code shortcuts for image paste. They read a clipboard image and attach it to the current draft when the selected session supports image input.
+- Text paste still uses the terminal bracketed paste path. In many terminals this is `Ctrl+Shift+V`; use the paste shortcut configured by your terminal.
+- If the selected model does not support image input, VT Code rejects both image paste and image submission, then shows a warning.
+- On WSL, VT Code first tries direct Linux clipboard access. If that cannot read an image, it tries a Windows clipboard image fallback through PowerShell.
+
+### Quick Commands
+
+| Shortcut                     | Description                                                | Notes                                                                                  |
+| :--------------------------- | :--------------------------------------------------------- | :------------------------------------------------------------------------------------- |
+| `#` at start of input        | Access custom prompts.                                     | Opens quick picker to select and run custom prompts directly from input bar.           |
+| `/` at start of input        | Issue a slash command.                                     | Run `/help` or `/slash-commands` in a session to list everything available.            |
+| `!` at start of input        | Enter Bash mode.                                           | Runs shell commands directly and streams their output.                                 |
+| `@` within input             | Open file picker.                                          | Triggers file path autocomplete and picker to quickly reference files in your message. |
+| `@agent-<name>` within input | Open subagent picker and insert an explicit agent mention. | Use `@agent-<plugin>:<name>` for plugin-provided agents.                               |
+| `Alt+P` / `Option+P`         | Generate an inline prompt suggestion.                      | Shows a ghost-text completion in the composer; `Tab` accepts it.                       |
+
+## Fullscreen Rendering
+
+When VT Code is running in alternate-screen mode, the transcript and composer use a fixed fullscreen layout similar to terminal applications such as `vim` or `less`. The input stays pinned at the bottom, mouse handling is internal to VT Code, and transcript review/search happens inside the app instead of your terminal scrollback.
+
+### Fullscreen Navigation
+
+| Shortcut        | Description                                                   |
+| :-------------- | :------------------------------------------------------------ |
+| `PgUp` / `PgDn` | Scroll the live transcript by half a page.                    |
+| `Ctrl+Home`     | Jump to the oldest transcript content.                        |
+| `Ctrl+End`      | Jump to the latest transcript content and resume auto-follow. |
+| Mouse wheel     | Scroll the live transcript when mouse capture is enabled.     |
+
+### Transcript Review Surface
+
+Press `Alt+O` to open the fullscreen transcript review surface. It builds a plain-text view of the full conversation, including expanded collapsed tool payloads, so search and export operate on the complete transcript rather than only the visible viewport.
+
+| Shortcut                   | Description                                                                              |
+| :------------------------- | :--------------------------------------------------------------------------------------- |
+| `/`                        | Start a case-insensitive transcript search.                                              |
+| `Enter`                    | Commit the current search and jump to the first match.                                   |
+| `Esc`                      | Cancel the active search, or close transcript review when search is idle.                |
+| `n` / `N`                  | Jump to the next or previous search match.                                               |
+| `j` / `k` or `Up` / `Down` | Scroll one line.                                                                         |
+| `Ctrl+U` / `Ctrl+D`        | Scroll half a page.                                                                      |
+| `Ctrl+B` / `b`             | Scroll a full page up.                                                                   |
+| `Ctrl+F` / `Space`         | Scroll a full page down.                                                                 |
+| `g` / `Home`               | Jump to the top.                                                                         |
+| `G` / `End`                | Jump to the bottom.                                                                      |
+| `[`                        | Hand the expanded transcript to the terminal's native scrollback until you return.       |
+| `v`                        | Write the expanded transcript to a temporary file and open it in your configured editor. |
+| `q` or `Alt+O`             | Close transcript review.                                                                 |
+
+### Mouse Capture, Copy, and tmux
+
+- `ui.fullscreen.mouse_capture = false` keeps fullscreen rendering but returns click-and-drag selection to the terminal. This also disables in-app wheel scrolling, click-to-expand, click-to-position, and link activation.
+- `ui.fullscreen.copy_on_select = false` disables automatic clipboard copy after an in-app text selection. Manual copy shortcuts still work.
+- `ui.fullscreen.scroll_speed` multiplies mouse-wheel scrolling without affecting `PgUp`/`PgDn`.
+- Inside tmux, enable mouse support with `set -g mouse on` if you want wheel scrolling and other mouse actions to reach VT Code.
+- Avoid fullscreen rendering in `tmux -CC` sessions. iTerm2's control-mode integration does not handle alternate-screen mouse capture reliably.
+
+### Session Context Commands
+
+- `/continue` resumes the most recently archived session in a new conversation. Equivalent to `vtcode --continue` from the CLI.
+- `/compact` compacts the current session history immediately when you want to shed context manually.
+- `/compact edit-prompt` and `/compact reset-prompt` manage the saved default prompt for manual compaction requests.
+- For providers with native Responses compaction, VT Code uses the provider-owned compacted state.
+ - For local fallback compaction, VT Code rebuilds history around one structured summary plus retained recent user messages, then injects the session memory envelope.
+ - Switching the main session model or provider mid-conversation (via `/model` or the model palette) automatically compacts the existing history before the next turn, so the newly selected model starts from a summary instead of the outgoing model's raw trace. The previous-response chain is cleared so the new model is not chained to the old Responses/cache identity. Reselecting the same model leaves history untouched.
+ - `context.dynamic.retained_user_messages` controls that retained-user-message budget; the default is `4`.
+- On the local fallback path, VT Code also deduplicates older repeated single-file reads before summarization so the newest read stays available without repeatedly bloating the prompt.
+- `/fork` opens the archived-session picker. After selecting a session, VT Code now asks whether the new session should start from the full copied transcript or from a summarized fork.
+- A summarized fork starts from the same compacted handoff shape VT Code uses for local compaction: structured summary, retained user prompts, and the memory envelope.
+- If a session stopped because it hit the local `max_budget_usd` limit, resuming it offers three choices: continue from the saved summary, continue with the full transcript after an explicit higher-cost warning, or start fresh.
+- `/agents` opens the subagent manager for creating, inspecting, editing, deleting, and browsing active delegated agents. New scaffolds use VT Code tool ids in frontmatter.
+- `/agent` opens the active-agent inspector. Selecting a child agent opens a modal over the current session instead of switching threads.
+- On an empty idle composer, `Tab` cycles primary agents and wraps back to the first agent.
+- The active primary agent is displayed in the session header badge and influences the session's instructions, model, granular permission policy, and tool access.
+- Mode switches are locked while a turn is actively processing. Pressing `Tab`/`Shift+Tab`/`Alt+M` (or running `/mode`/`/plan`) during a turn is dropped with a notice and applies only once the turn finishes. This keeps the agent's mode and tool-access state consistent for the duration of a turn; the in-turn automatic planning intent detection is unaffected.
+- `/subprocesses` opens the Local Agents drawer for delegated agents and managed background subprocesses.
+
+## Scheduled Prompts And Reminders
+
+- VT Code also recognizes narrow reminder phrases in chat such as `remind me at 3pm to ...`, `in 45 minutes, ...`, `what scheduled tasks do I have?`, and `cancel <job id|name>`.
+- Session-scoped scheduled prompts fire only at idle boundaries so they do not interrupt an in-flight turn.
+- For full behavior, limits, and CLI examples, see [Scheduled Tasks](./scheduled-tasks.md).
+
+## Vim Mode
+
+VT Code supports an optional Vim-style prompt editor.
+
+- Set `ui.vim_mode = true` to enable it by default for new sessions.
+- Use `/vim`, `/vim on`, and `/vim off` to change the current session only.
+- Supported modes are `INSERT` and `NORMAL`.
+- Supported subset includes motions, change/delete/yank operators, `f/F/t/T`, text objects, `p/P`, `J`, and repeat with `.`.
+- VT Code does not implement visual mode, macros, or multiple registers; yanks reuse the single session clipboard.
+- VT Code-specific prompt controls still win when relevant, including `Enter`, `Tab`, `Ctrl+Enter`, `/`, `@`, and `!`.
+
+## Prompt Suggestions, Tasks, and Jobs
+
+- `/suggest` opens a prompt-suggestion picker built from recent session context such as task state, active jobs, recent errors, and recent file activity.
+- `Alt+P` requests one inline ghost-text suggestion for the current draft. If a ghost suggestion is visible, `Tab` accepts it; otherwise `Tab` keeps its normal queue behavior.
+- VT Code routes prompt suggestion generation through `agent.prompt_suggestions` and falls back to deterministic local suggestions when the provider, model, or endpoint cannot service the request.
+- LLM-backed prompt suggestions can consume tokens. When `agent.prompt_suggestions.show_cost_notice = true`, VT Code shows a one-time reminder in the session before the first LLM-backed inline suggestion.
+- Picking a suggestion inserts it into the composer. Empty drafts are replaced; non-empty drafts keep their content and append the suggestion after a blank line.
+- `/tasks` toggles the dedicated TODO panel. It is fed directly from `task_tracker` output and remains independent from the `Ctrl+T` log toggle.
+- `/jobs` opens the active/background jobs picker for PTY-backed command sessions.
+- In `/jobs`, `Enter` or `Ctrl+R` focuses the selected job output, `Ctrl+P` previews a snapshot modal, and `Ctrl+X` sends an interrupt to the selected job.
+- Pressing `Enter` on an empty draft opens `/jobs` when active jobs exist; otherwise VT Code keeps the normal empty-enter behavior.
+
+## Active Run Steering
+
+When a task is already running, VT Code keeps the active turn alive and lets you steer it:
+
+- `Enter` and `Tab` queue the current input for later processing.
+- `Ctrl+Enter` sends the current draft to the active run as steering text.
+- `/pause` pauses the active run at the next model/tool/approval boundary.
+- `/resume` resumes a paused run while it is active. When idle, `/resume` still opens archived sessions.
+- `/stop` still cancels the active run immediately.
+- `/compact` still works only while the session is idle; it rewrites the stored conversation context for the next turn instead of interrupting the active run.
+- `/fork` is available while idle and creates a new archived session, leaving the current session unchanged.
+- `Ctrl+B` starts or stops the configured default background subagent when background mode is enabled and `default_agent` is set. Otherwise it opens the Local Agents drawer and shows setup guidance.
+- `Alt+S` opens or focuses the Local Agents drawer.
+- When the composer is empty and local agents exist, `Down` opens the Local Agents drawer. `Up` and `Down` keep normal history navigation once history traversal is active.
+- In the active-agent and subprocess inspectors, `Esc` closes the overlay, `Ctrl+R` reloads it, `Ctrl+K` requests a graceful stop, and `Ctrl+X` force-cancels the selected subprocess.
+- Foreground `!` commands keep their status in the input/status area, and `Esc` collapses verbose output without killing the job.
+
+## PR Review Status
+
+- On GitHub-backed repositories, the header can show a PR review badge such as `PR: ready`, `PR: reviewed`, or `PR: outdated`.
+- VT Code uses read-only `gh` inspection for this status. If `gh` is missing or unauthenticated, the header shows the appropriate CTA instead of failing the session.
+- The badge refreshes as branch and HEAD state change, and warnings appear when your review is outdated or you do not have write access.
+
+## Planning Workflow Notes
+
+- The built-in `plan` primary agent is read-oriented and intended for repository exploration, trade-off discussion, and proposal drafting.
+- `/plan` starts or continues the planning workflow command; it is not a session state selector.
+- The agent emits planning output in `<proposed_plan>...</proposed_plan>` blocks.
+- `task_tracker` mirrors checklist state with plan sidecars where planning artefacts are enabled.
+- When you are ready to implement, switch to a build-oriented primary agent such as `build` or `auto`.
+
+## Command History
+
+VT Code keeps a command history scoped to the working directory. The history resets when you clear it manually or start a new directory session.
+
+- Cleared with the `/clear` command.
+- Use the arrow keys to navigate between entries.
+- History expansion via `!` is disabled by default to prevent accidental execution.
+
+### Reverse Search with `Ctrl+R`
+
+1. Press `Ctrl+R` to start the reverse history search.
+2. Type a query to highlight matching entries.
+3. Press `Ctrl+R` again to cycle through older matches.
+4. Accept the current match with `Tab`, `Esc`, or `Enter` to execute immediately.
+5. Cancel the search with `Ctrl+C` or `Backspace` on an empty query.
+
+## Background Bash Commands
+
+The Bash integration can run long commands asynchronously while you continue working with the agent.
+
+### Running in the Background
+
+- Ask VT Code to run a command in the background, or
+- Press `Ctrl+B` while a command runs to move it to the background (press twice if your terminal uses tmux with the same prefix).
+
+Background tasks return immediately with an ID. VT Code keeps streaming updates via the BashOutput tool, and tasks are automatically cleaned up when the session ends.
+
+Common backgrounded commands include:
+
+- Build systems (e.g., webpack, vite, make)
+- Package managers (npm, yarn, pnpm)
+- Test runners (jest, pytest)
+- Development servers and other long-running processes
+
+### Bash Mode with `!`
+
+Prefix input with `!` to run commands directly without agent interpretation:
+
+```bash
+! npm test
+! git status
+! ls -la
+```
+
+Bash mode streams the command and its output into the chat, supports backgrounding via `Ctrl+B`, and is ideal for quick shell operations while keeping a shared context with the agent.
+
+## Additional Resources
+
+- [User guide overview](../README.md)
+- [Getting started walkthrough](../user-guide/getting-started.md)

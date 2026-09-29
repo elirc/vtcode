@@ -1,0 +1,130 @@
+#![allow(missing_docs)]
+//! Focused test for LLM provider functionality
+
+use std::sync::Arc;
+
+use vtcode_core::config::constants::models;
+use vtcode_core::config::types::VerbosityLevel;
+use vtcode_core::llm::{
+    factory::{LLMFactory, create_provider_for_model},
+    provider::{LLMProvider, LLMRequest, Message, MessageRole},
+    providers::{
+        AnthropicProvider, GeminiProvider, LmStudioProvider, MoonshotProvider, OllamaProvider, OpenAIProvider,
+        OpenRouterProvider,
+    },
+};
+
+#[test]
+fn test_provider_factory_basic() {
+    let factory = LLMFactory::new();
+    // Test available providers
+    let providers = factory.list_providers();
+    assert!(providers.contains(&"gemini".to_string()));
+    assert!(providers.contains(&"openai".to_string()));
+    assert!(providers.contains(&"anthropic".to_string()));
+    assert!(providers.contains(&"copilot".to_string()));
+    assert!(providers.contains(&"openrouter".to_string()));
+    assert!(providers.contains(&"moonshot".to_string()));
+    assert!(providers.contains(&"deepseek".to_string()));
+    assert!(providers.contains(&"zai".to_string()));
+    assert!(providers.contains(&"ollama".to_string()));
+    assert!(providers.contains(&"lmstudio".to_string()));
+    assert!(providers.contains(&"minimax".to_string()));
+    assert!(providers.contains(&"huggingface".to_string()));
+    assert!(providers.contains(&"openresponses".to_string()));
+}
+
+#[test]
+fn test_provider_auto_detection() {
+    let factory = LLMFactory::new();
+
+    assert_eq!(factory.provider_from_model("gpt-oss-20b"), Some("openai".to_string()));
+    assert_eq!(factory.provider_from_model(models::CLAUDE_SONNET_4_6), Some("anthropic".to_string()));
+    assert_eq!(factory.provider_from_model("claude-sonnet-4-20250514"), Some("anthropic".to_string()));
+    assert_eq!(factory.provider_from_model("gemini-3-flash-preview"), Some("gemini".to_string()));
+    assert_eq!(factory.provider_from_model(models::openrouter::DEEPSEEK_V4_PRO), Some("openrouter".to_string()));
+    assert_eq!(factory.provider_from_model(models::moonshot::DEFAULT_MODEL), Some("moonshot".to_string()));
+    assert_eq!(
+        factory.provider_from_model(models::lmstudio::META_LLAMA_31_8B_INSTRUCT),
+        Some("lmstudio".to_string())
+    );
+    assert_eq!(factory.provider_from_model("unknown-model"), None);
+}
+
+#[test]
+fn test_unified_client_creation() {
+    // Test creating providers directly using the factory
+    let gemini = create_provider_for_model("gemini-3-flash-preview", "test_key".to_string(), None, None);
+    gemini.unwrap();
+
+    let openai = create_provider_for_model(models::GPT_OSS_20B, "test_key".to_string(), None, None);
+    openai.unwrap();
+
+    let anthropic = create_provider_for_model(models::CLAUDE_SONNET_4_6, "test_key".to_string(), None, None);
+    anthropic.unwrap();
+
+    let openrouter = create_provider_for_model(models::openrouter::DEEPSEEK_V4_PRO, "test_key".to_string(), None, None);
+    openrouter.unwrap();
+
+    let moonshot = create_provider_for_model(models::moonshot::DEFAULT_MODEL, "test_key".to_string(), None, None);
+    moonshot.unwrap();
+
+    let ollama = create_provider_for_model(models::ollama::DEFAULT_MODEL, String::new(), None, None);
+    ollama.unwrap();
+
+    let lmstudio = create_provider_for_model(models::lmstudio::DEFAULT_MODEL, String::new(), None, None);
+    lmstudio.unwrap();
+}
+
+#[test]
+fn test_message_creation() {
+    let user_msg = Message::user("Hello".to_string());
+    assert_eq!(user_msg.content.as_text(), "Hello");
+    assert!(matches!(user_msg.role, MessageRole::User));
+
+    let assistant_msg = Message::assistant("Hi".to_string());
+    assert_eq!(assistant_msg.content.as_text(), "Hi");
+    assert!(matches!(assistant_msg.role, MessageRole::Assistant));
+}
+
+#[test]
+fn test_provider_names() {
+    let gemini = GeminiProvider::new("test_key".to_string());
+    assert_eq!(gemini.name(), "gemini");
+
+    let openai = OpenAIProvider::new("test_key".to_string());
+    assert_eq!(openai.name(), "openai");
+
+    let anthropic = AnthropicProvider::new("test_key".to_string());
+    assert_eq!(anthropic.name(), "anthropic");
+
+    let openrouter = OpenRouterProvider::new("test_key".to_string());
+    assert_eq!(openrouter.name(), "openrouter");
+
+    let moonshot = MoonshotProvider::new("test_key".to_string());
+    assert_eq!(moonshot.name(), "moonshot");
+
+    let ollama = OllamaProvider::new(String::new());
+    assert_eq!(ollama.name(), "ollama");
+
+    let lmstudio = LmStudioProvider::new(String::new());
+    assert_eq!(lmstudio.name(), "lmstudio");
+}
+
+#[test]
+fn test_anthropic_tool_message_handling() {
+    let anthropic = AnthropicProvider::new("test_key".to_string());
+
+    // Test that tool messages are converted to user messages for Anthropic
+    let tool_message = Message::tool_response("call_1".to_string(), "Tool result".to_string());
+
+    let request = LLMRequest {
+        messages: Arc::new(vec![tool_message]),
+        model: models::CLAUDE_SONNET_4_6.to_string(),
+        verbosity: Some(VerbosityLevel::default()),
+        ..Default::default()
+    };
+
+    // Validate request shape instead of internal conversion
+    anthropic.validate_request(&request).unwrap();
+}

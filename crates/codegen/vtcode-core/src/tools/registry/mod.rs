@@ -1,0 +1,2158 @@
+//! Tool registry and function declarations
+
+mod approval_recorder;
+mod assembly;
+mod availability_facade;
+mod builder;
+mod builtins;
+mod cache;
+mod catalog_facade;
+mod cgp_facade;
+mod circuit_breaker;
+mod commands_facade;
+mod config_helpers;
+mod distributed;
+mod dual_output;
+mod error;
+mod execution_facade;
+mod execution_history;
+mod execution_kernel;
+mod execution_request;
+mod execution_stages;
+mod executors;
+pub mod file_helpers;
+mod file_monitor_facade;
+mod harness;
+mod harness_facade;
+mod history_facade;
+pub mod interfaces;
+mod inventory;
+mod inventory_facade;
+mod justification;
+mod justification_extractor;
+pub mod labels;
+mod maintenance;
+mod mcp_facade;
+mod mcp_helpers;
+mod metrics_facade;
+mod optimization_facade;
+mod output_processing;
+mod pack;
+mod pack_impls;
+mod planning_workflow_checks;
+mod planning_workflow_facade;
+mod policy;
+mod policy_facade;
+mod progress_facade;
+mod pty;
+mod pty_facade;
+mod registration;
+mod registration_facade;
+mod resiliency;
+mod resiliency_facade;
+mod risk_scorer;
+mod runtime_config_facade;
+mod sandbox_facade;
+mod scheduler_facade;
+mod search_runtime_facade;
+mod shell_policy;
+mod shell_policy_facade;
+mod spooler_facade;
+mod subagent_facade;
+mod telemetry;
+mod timeout;
+mod timeout_category;
+mod timeout_facade;
+mod tool_catalog_facade;
+mod tool_executor_impl;
+mod tool_search_index;
+mod trait_impls;
+mod unified_actions;
+mod utils;
+
+pub use approval_recorder::ApprovalRecorder;
+pub use cgp_facade::CgpRuntimeMode;
+pub use cgp_facade::native_cgp_tool_factory;
+pub use cgp_facade::wrap_registered_native_tool;
+pub use error::{ToolErrorType, ToolExecutionError};
+pub use execution_history::{
+    HarnessContextSnapshot, ToolExecutionHistory, ToolExecutionRecord, ToolTaskTelemetrySnapshot,
+};
+pub use execution_kernel::ToolPreflightOutcome;
+pub use execution_request::{ExecSettlementMode, ExecutionPolicySnapshot, ToolExecutionOutcome, ToolExecutionRequest};
+pub use harness::HarnessContext;
+pub use justification::{ApprovalPattern, JustificationManager, ToolJustification};
+pub use justification_extractor::JustificationExtractor;
+pub use pty::{PtySessionGuard, PtySessionManager};
+pub use registration::{
+    NativeCgpToolFactory, ToolCatalogSource, ToolExecutorFn, ToolHandler, ToolRegistration,
+    ToolRegistrationSpec as ToolMetadata,
+};
+pub use resiliency::{ResiliencyContext, ToolFailureTracker};
+pub use risk_scorer::{RiskLevel, ToolRiskContext, ToolRiskScorer, ToolSource, WorkspaceTrust};
+pub use shell_policy::ShellPolicyChecker;
+pub use telemetry::ToolTelemetryEvent;
+pub use timeout::{AdaptiveTimeoutTuning, ToolLatencyStats, ToolTimeoutCategory, ToolTimeoutPolicy};
+pub use tool_catalog_facade::{SessionToolCatalogState, ToolGroup, tool_groups};
+
+// Re-export trait interfaces for external consumers.
+pub use interfaces::{
+    McpBridge, PtySessionControl, SharedRegistry, ToolCatalog, ToolMetrics, ToolRegistryApi, ToolResilience,
+    ToolSecurity,
+};
+
+use assembly::ToolAssembly;
+use inventory::ToolInventory;
+use policy::ToolPolicyGateway;
+use utils::normalize_tool_output;
+
+use crate::tools::exec_session::ExecSessionManager;
+use crate::tools::handlers::PlanningWorkflowState;
+pub(super) use crate::tools::pty::PtyManager;
+use crate::tools::result::ToolResult as SplitToolResult;
+use crate::tools::safety_gateway::SafetyGateway;
+use parking_lot::Mutex; // Use parking_lot for better performance
+use rustc_hash::FxHashMap;
+use std::sync::{Arc, Weak};
+
+use crate::exec::code_executor::{BuiltinToolExecutor, BuiltinToolInfo};
+use crate::mcp::McpClient;
+use crate::subagents::SubagentController;
+use crate::tools::edited_file_monitor::EditedFileMonitor;
+use async_trait::async_trait;
+use std::sync::RwLock;
+
+pub type SessionModelTools = Arc<tokio::sync::RwLock<Vec<crate::llm::provider::ToolDefinition>>>;
+
+/// Callback for tool progress and output streaming
+pub type ToolProgressCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+use super::traits::Tool;
+
+#[cfg(test)]
+use crate::config::types::CapabilityLevel;
+
+/// Default window size for loop detection.
+const DEFAULT_LOOP_DETECT_WINDOW: usize = 5;
+
+#[derive(Clone)]
+pub struct ToolRegistry {
+    inventory: ToolInventory,
+    edited_file_monitor: Arc<EditedFileMonitor>,
+    policy_gateway: Arc<tokio::sync::Mutex<ToolPolicyGateway>>,
+    pty_sessions: PtySessionManager,
+    exec_sessions: ExecSessionManager,
+    mcp_client: Arc<parking_lot::RwLock<Option<Arc<McpClient>>>>,
+    mcp_tool_index: Arc<tokio::sync::RwLock<FxHashMap<String, Vec<String>>>>,
+    mcp_reverse_index: Arc<tokio::sync::RwLock<FxHashMap<String, String>>>,
+    timeout_policy: Arc<parking_lot::RwLock<ToolTimeoutPolicy>>,
+    execution_history: ToolExecutionHistory,
+    harness_context: HarnessContext,
+
+    // Mutable runtime state wrapped for concurrent access
+    resiliency: Arc<Mutex<ResiliencyContext>>,
+
+    /// MP-3: Circuit breaker for MCP client failures
+    mcp_circuit_breaker: Arc<circuit_breaker::McpCircuitBreaker>,
+    /// Shared per-tool circuit breaker state used by the runloop.
+    shared_circuit_breaker: Arc<RwLock<Option<Arc<crate::tools::circuit_breaker::CircuitBreaker>>>>,
+    initialized: Arc<std::sync::atomic::AtomicBool>,
+    // Security & Identity
+    shell_policy: Arc<RwLock<ShellPolicyChecker>>,
+    runtime_sandbox_config: Arc<RwLock<vtcode_config::SandboxConfig>>,
+    agent_type: Arc<RwLock<String>>,
+    // PTY Session Management
+    active_pty_sessions: Arc<RwLock<Option<Arc<std::sync::atomic::AtomicUsize>>>>,
+
+    // Caching
+    cached_available_tools: Arc<parking_lot::RwLock<Option<Vec<String>>>>,
+    /// Active model-facing profile used by catalogue and policy projections.
+    active_tool_profile: Arc<RwLock<crate::config::ToolProfile>>,
+    /// Callback for streaming tool output and progress
+    progress_callback: Arc<RwLock<Option<ToolProgressCallback>>>,
+    // Performance Observability
+    /// Total tool calls made in current session
+    pub(crate) tool_call_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Total PTY poll iterations (for monitoring CPU usage)
+    pub(crate) pty_poll_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared metrics collector for reliability and execution observability
+    metrics: Arc<crate::metrics::MetricsCollector>,
+
+    // PERFORMANCE OPTIMIZATIONS - Actually integrated into the real registry
+    /// Memory pool for reducing allocations in hot paths
+    memory_pool: Arc<crate::core::memory_pool::MemoryPool>,
+    /// Hot cache for frequently accessed tools (reduces HashMap lookups)
+    hot_tool_cache: Arc<parking_lot::RwLock<lru::LruCache<String, Arc<dyn Tool>>>>,
+    /// Optimization configuration
+    optimization_config: vtcode_config::OptimizationConfig,
+
+    /// Composable middleware chain for pre/post tool execution hooks.
+    middleware: crate::tools::tool_middleware::MiddlewareChain,
+
+    /// Output spooler for dynamic context discovery (large outputs to files)
+    output_spooler: Arc<super::output_spooler::ToolOutputSpooler>,
+
+    /// Shared Planning workflow state (plan file tracking, active flag) for enter/exit tools
+    /// and read-only enforcement. This is the single source of truth for planning workflow;
+    /// use `is_planning_active()` / `enable_planning()` / `disable_planning()` as accessors.
+    planning_workflow_state: PlanningWorkflowState,
+    /// Canonical safety gateway shared across registry execution surfaces.
+    safety_gateway: Arc<SafetyGateway>,
+    /// Active CGP runtime mode for wrapping registrations added after startup.
+    cgp_runtime_mode: Arc<RwLock<Option<CgpRuntimeMode>>>,
+    /// Canonical manifest-driven tool assembly used by routing, catalog projections, and policy sync.
+    tool_assembly: Arc<RwLock<ToolAssembly>>,
+    /// Registry-owned tool catalog snapshot cache shared by harnesses.
+    tool_catalog_state: Arc<SessionToolCatalogState>,
+    /// Shared subagent controller when the session enables delegated child agents.
+    subagent_controller: Arc<RwLock<Option<Arc<SubagentController>>>>,
+    /// Session-scoped scheduled prompts for interactive loops and cron tools.
+    session_scheduler: Arc<tokio::sync::Mutex<crate::scheduler::SessionScheduler>>,
+    /// Live model-facing tool definitions attached by the runloop.
+    session_model_tools: Arc<RwLock<Option<SessionModelTools>>>,
+    /// Weak self-reference used by the code executor's built-in tool bridge.
+    self_ref: Arc<RwLock<Option<Weak<ToolRegistry>>>>,
+}
+
+const BUILTIN_CODE_TOOLS: &[&str] = &[
+    crate::config::constants::tools::UNIFIED_FILE,
+    crate::config::constants::tools::CODE_SEARCH,
+    crate::config::constants::tools::WEB_FETCH,
+    crate::config::constants::tools::WEB_SEARCH,
+    crate::config::constants::tools::CRON,
+    crate::config::constants::tools::MEMORY,
+    crate::config::constants::tools::TASK_TRACKER,
+];
+
+fn builtin_code_tool_description(name: &str) -> String {
+    match name {
+        n if n == crate::config::constants::tools::UNIFIED_FILE => "Read, write, edit, move, copy, or delete files.",
+        n if n == crate::config::constants::tools::CODE_SEARCH => {
+            "Search code by query, with optional path, file_types, result_types, and max_results."
+        }
+        n if n == crate::config::constants::tools::WEB_FETCH => {
+            "Fetch a URL and return an analysed summary or markdown."
+        }
+        n if n == crate::config::constants::tools::WEB_SEARCH => "Run a web search and return ranked results.",
+        n if n == crate::config::constants::tools::CRON => "Manage scheduled prompts.",
+        n if n == crate::config::constants::tools::MEMORY => "Read or update persistent project memory.",
+        n if n == crate::config::constants::tools::TASK_TRACKER => "Track multi-step task checklists.",
+        _ => "Built-in VT Code tool.",
+    }
+    .to_string()
+}
+
+impl ToolRegistry {
+    pub fn set_self_ref(&self, registry: Arc<ToolRegistry>) {
+        *self.self_ref.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&registry));
+    }
+
+    pub(crate) fn builtin_executor_for_code(&self) -> Option<Arc<dyn BuiltinToolExecutor>> {
+        self.self_ref
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|registry| registry as Arc<dyn BuiltinToolExecutor>)
+    }
+}
+
+#[async_trait]
+impl BuiltinToolExecutor for ToolRegistry {
+    async fn execute_builtin_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        if !BUILTIN_CODE_TOOLS.contains(&tool_name) {
+            anyhow::bail!("tool '{tool_name}' is not exposed to code snippets");
+        }
+        self.execute_tool(tool_name, args.clone()).await
+    }
+
+    fn list_builtin_tools(&self) -> anyhow::Result<Vec<BuiltinToolInfo>> {
+        Ok(BUILTIN_CODE_TOOLS
+            .iter()
+            .map(|name| BuiltinToolInfo {
+                name: (*name).to_string(),
+                description: builtin_code_tool_description(name),
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPermissionDecision {
+    Allow,
+    Deny,
+    Prompt,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TimeoutsConfig;
+    use crate::config::ToolDocumentationMode as ConfigToolDocumentationMode;
+    use crate::config::ToolsConfig;
+    use crate::constants::tools;
+    use crate::tool_policy::{ToolConstraints, ToolPolicy, ToolPolicyConfig};
+    use crate::tools::handlers::{SessionSurface, SessionToolsConfig, ToolModelCapabilities, ToolProfile};
+    use crate::tools::registry::mcp_helpers::normalize_mcp_tool_identifier;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use futures::future::BoxFuture;
+    use serde_json::Value;
+    use serde_json::json;
+    use std::fs;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use vtcode_commons::canonicalize;
+
+    const CUSTOM_TOOL_NAME: &str = "custom_test_tool";
+    const SLOW_TIMEOUT_TOOL_NAME: &str = "slow_timeout_test_tool";
+    const REENTRANT_TOOL_NAME: &str = "reentrant_guard_test_tool";
+    const MUTUAL_REENTRANT_TOOL_A: &str = "mutual_reentrant_tool_a";
+    const MUTUAL_REENTRANT_TOOL_B: &str = "mutual_reentrant_tool_b";
+    const REPLACE_DISPATCH_TOOL_NAME: &str = "replace_dispatch_test_tool";
+
+    struct CustomEchoTool;
+    struct SlowTimeoutTool;
+
+    #[async_trait]
+    impl Tool for CustomEchoTool {
+        async fn execute(&self, args: Value) -> Result<Value> {
+            Ok(json!({
+                "success": true,
+                "args": args,
+            }))
+        }
+
+        fn name(&self) -> &str {
+            CUSTOM_TOOL_NAME
+        }
+
+        fn description(&self) -> &str {
+            "Custom echo tool for testing"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for SlowTimeoutTool {
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            Ok(json!({
+                "ok": true,
+            }))
+        }
+
+        fn name(&self) -> &str {
+            SLOW_TIMEOUT_TOOL_NAME
+        }
+
+        fn description(&self) -> &str {
+            "Tool that intentionally exceeds low timeout ceilings"
+        }
+    }
+
+    fn reentrant_tool_executor<'a>(registry: &'a ToolRegistry, args: Value) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move { registry.execute_tool_ref(REENTRANT_TOOL_NAME, &args).await })
+    }
+
+    fn mutual_reentrant_tool_a_executor<'a>(registry: &'a ToolRegistry, args: Value) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move { registry.execute_tool_ref(MUTUAL_REENTRANT_TOOL_B, &args).await })
+    }
+
+    fn mutual_reentrant_tool_b_executor<'a>(registry: &'a ToolRegistry, args: Value) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move { registry.execute_tool_ref(MUTUAL_REENTRANT_TOOL_A, &args).await })
+    }
+
+    fn replacement_first_executor<'a>(_registry: &'a ToolRegistry, _args: Value) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move { Ok(json!({"version": 1})) })
+    }
+
+    fn replacement_second_executor<'a>(_registry: &'a ToolRegistry, _args: Value) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move { Ok(json!({"version": 2})) })
+    }
+
+    fn catalogue_race_executor<'a>(_registry: &'a ToolRegistry, _args: Value) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async { Ok(json!({"status": "ok"})) })
+    }
+
+    fn advanced_session_tools_config() -> SessionToolsConfig {
+        SessionToolsConfig::full_public(
+            SessionSurface::Interactive,
+            CapabilityLevel::CodeSearch,
+            ConfigToolDocumentationMode::Full,
+            ToolModelCapabilities::default(),
+        )
+        .with_tool_profile(ToolProfile::AdvancedVtCode)
+    }
+
+    async fn policy_catalogue_test_hooks(registry: &ToolRegistry) -> Arc<policy::PolicyCatalogueTestHooks> {
+        registry.policy_gateway.lock().await.full_auto_catalogue_test_hooks()
+    }
+
+    async fn wait_for_catalogue_pause(pause: &policy::PolicyCatalogueTestPause) {
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_reached())
+            .await
+            .expect("catalogue operation reached the controlled pause");
+    }
+
+    async fn assert_catalogue_task_remains_pending<T>(task: &mut tokio::task::JoinHandle<T>, task_name: &str) {
+        tokio::select! {
+            outcome = &mut *task => match outcome {
+                Ok(_) => panic!("{task_name} completed while catalogue refresh was paused"),
+                Err(error) => panic!(
+                    "{task_name} failed while catalogue refresh was paused: {error}"
+                ),
+            },
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn registers_builtin_tools() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        let available = registry.available_tools().await;
+
+        assert!(available.contains(&tools::EXEC_COMMAND.to_string()));
+        assert!(available.contains(&tools::WRITE_STDIN.to_string()));
+        assert!(available.contains(&tools::APPLY_PATCH.to_string()));
+        assert!(!available.contains(&tools::CODE_SEARCH.to_string()));
+        assert!(!available.contains(&tools::UNIFIED_SEARCH.to_string()));
+        assert!(!available.contains(&tools::UNIFIED_FILE.to_string()));
+        assert!(!available.contains(&tools::UNIFIED_EXEC.to_string()));
+        assert!(!available.contains(&tools::READ_FILE.to_string()));
+        assert!(!available.contains(&tools::WRITE_FILE.to_string()));
+        assert!(!available.contains(&tools::DELETE_FILE.to_string()));
+        assert!(!available.contains(&tools::MOVE_FILE.to_string()));
+        assert!(!available.contains(&tools::COPY_FILE.to_string()));
+        assert!(!available.contains(&tools::RUN_PTY_CMD.to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_user_input_aliases_are_not_registered() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        assert!(registry.get_tool(tools::REQUEST_USER_INPUT).is_some());
+        assert!(registry.get_tool(tools::ASK_QUESTIONS).is_none());
+        assert!(registry.get_tool(tools::ASK_USER_QUESTION).is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_tool_projections_stay_in_sync() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        let config = SessionToolsConfig::full_public(
+            SessionSurface::Interactive,
+            CapabilityLevel::CodeSearch,
+            ConfigToolDocumentationMode::Full,
+            ToolModelCapabilities::default(),
+        );
+
+        let names = registry
+            .public_tool_names(SessionSurface::Interactive, CapabilityLevel::CodeSearch)
+            .await;
+        let schema_names = registry
+            .schema_entries(config.clone())
+            .await
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        let declaration_names = registry
+            .function_declarations(config.clone())
+            .await
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        let model_tool_names = registry
+            .model_tools(config)
+            .await
+            .into_iter()
+            .map(|tool| tool.function_name().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(schema_names, names);
+        assert_eq!(declaration_names, names);
+        assert_eq!(model_tool_names, names);
+        assert_eq!(
+            names,
+            vec![
+                tools::APPLY_PATCH.to_string(),
+                tools::EXEC_COMMAND.to_string(),
+                tools::WRITE_STDIN.to_string(),
+            ]
+        );
+        for removed_tool in [
+            tools::UNIFIED_EXEC,
+            tools::UNIFIED_FILE,
+            tools::UNIFIED_SEARCH,
+            tools::LIST_FILES,
+            tools::READ_FILE,
+            tools::WRITE_FILE,
+            tools::DELETE_FILE,
+            tools::MOVE_FILE,
+            tools::COPY_FILE,
+        ] {
+            assert!(
+                registry.get_tool_schema(removed_tool).await.is_none(),
+                "{removed_tool} schema should not be discoverable"
+            );
+            assert!(!registry.has_tool(removed_tool).await, "{removed_tool} should not be reported as available");
+        }
+
+        let code_search_schema = registry
+            .get_tool_schema(tools::CODE_SEARCH)
+            .await
+            .expect("code_search schema should be discoverable on request");
+        let code_search_parameters = &code_search_schema["parameters"];
+        assert_eq!(code_search_parameters["required"], json!(["query"]));
+        assert_eq!(code_search_parameters["additionalProperties"], false);
+        let mut property_names = code_search_parameters["properties"]
+            .as_object()
+            .expect("code_search properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        property_names.sort_unstable();
+        assert_eq!(property_names, ["file_types", "max_results", "path", "query", "result_types"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advanced_profile_exposes_code_search_without_removed_public_names() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        let config = SessionToolsConfig::full_public(
+            SessionSurface::Interactive,
+            CapabilityLevel::CodeSearch,
+            ConfigToolDocumentationMode::Full,
+            ToolModelCapabilities::default(),
+        )
+        .with_tool_profile(ToolProfile::AdvancedVtCode);
+
+        let names = registry
+            .schema_entries(config.clone())
+            .await
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&tools::CODE_SEARCH.to_string()), "advanced profile should expose code_search");
+        for removed_tool in [
+            tools::UNIFIED_EXEC,
+            tools::UNIFIED_FILE,
+            tools::UNIFIED_SEARCH,
+            tools::READ_FILE,
+            tools::WRITE_FILE,
+            tools::DELETE_FILE,
+            tools::MOVE_FILE,
+            tools::COPY_FILE,
+        ] {
+            assert!(
+                !names.contains(&removed_tool.to_string()),
+                "{removed_tool} must not be exposed in the advanced profile"
+            );
+        }
+
+        let model_tool_names = registry
+            .model_tools(config)
+            .await
+            .into_iter()
+            .map(|tool| tool.function_name().to_string())
+            .collect::<Vec<_>>();
+        assert!(model_tool_names.contains(&tools::CODE_SEARCH.to_string()));
+        assert!(!model_tool_names.contains(&tools::UNIFIED_SEARCH.to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_routing_keeps_aliases_private_and_rebuilds_on_dynamic_updates() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let test_file = temp_dir.path().join("alias-read.txt");
+        fs::write(&test_file, "via alias\n")?;
+
+        let err = registry
+            .execute_public_tool_ref(tools::READ_FILE, &json!({"path": test_file.to_string_lossy().to_string()}))
+            .await
+            .expect_err("read_file should not resolve through public routing");
+        assert!(err.to_string().contains("Unknown tool"));
+
+        registry
+            .register_tool(
+                ToolRegistration::from_tool_instance(CUSTOM_TOOL_NAME, CapabilityLevel::CodeSearch, CustomEchoTool)
+                    .with_description("Custom echo tool for testing")
+                    .with_parameter_schema(json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {"type": "string"}
+                        }
+                    }))
+                    .with_aliases(["custom_tool_alias"]),
+            )
+            .await?;
+
+        let public_names = registry
+            .public_tool_names(SessionSurface::Interactive, CapabilityLevel::CodeSearch)
+            .await;
+        assert!(!public_names.contains(&CUSTOM_TOOL_NAME.to_string()));
+        assert!(!public_names.contains(&"custom_tool_alias".to_string()));
+
+        let schema_names = registry
+            .schema_entries(SessionToolsConfig::full_public(
+                SessionSurface::Interactive,
+                CapabilityLevel::CodeSearch,
+                ConfigToolDocumentationMode::Full,
+                ToolModelCapabilities::default(),
+            ))
+            .await
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert!(!schema_names.contains(&CUSTOM_TOOL_NAME.to_string()));
+        assert!(!schema_names.contains(&"custom_tool_alias".to_string()));
+
+        let dynamic_result = registry
+            .execute_public_tool_ref("custom_tool_alias", &json!({"input": "value"}))
+            .await?;
+        assert_eq!(dynamic_result["success"].as_bool(), Some(true));
+
+        registry.unregister_tool(CUSTOM_TOOL_NAME).await?;
+
+        let public_names = registry
+            .public_tool_names(SessionSurface::Interactive, CapabilityLevel::CodeSearch)
+            .await;
+        assert!(!public_names.contains(&CUSTOM_TOOL_NAME.to_string()));
+
+        let err = registry
+            .execute_public_tool_ref("custom_tool_alias", &json!({"input": "value"}))
+            .await
+            .expect_err("alias should be removed with the registration");
+        assert!(err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allows_registering_custom_tools() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry
+            .register_tool(
+                ToolRegistration::from_tool_instance(CUSTOM_TOOL_NAME, CapabilityLevel::CodeSearch, CustomEchoTool)
+                    .with_parameter_schema(json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {"type": "string"}
+                        }
+                    })),
+            )
+            .await?;
+
+        registry.allow_all_tools().await?;
+
+        let available = registry.available_tools().await;
+        assert!(!available.contains(&CUSTOM_TOOL_NAME.to_string()));
+
+        let response = registry.execute_tool(CUSTOM_TOOL_NAME, json!({"input": "value"})).await?;
+        assert!(response["success"].as_bool().unwrap_or(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_registration_keeps_policy_catalog_in_sync() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let policy_path = temp_dir.path().join("tool-policy.json");
+        let policy_manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        let registry = ToolRegistry::new_with_custom_policy(temp_dir.path().to_path_buf(), policy_manager).await;
+
+        registry
+            .register_tool(ToolRegistration::from_tool_instance(
+                CUSTOM_TOOL_NAME,
+                CapabilityLevel::CodeSearch,
+                CustomEchoTool,
+            ))
+            .await?;
+
+        let config: ToolPolicyConfig = serde_json::from_str(&fs::read_to_string(&policy_path)?)?;
+        assert!(config.available_tools.contains(&CUSTOM_TOOL_NAME.to_string()));
+
+        registry.unregister_tool(CUSTOM_TOOL_NAME).await?;
+
+        let config: ToolPolicyConfig = serde_json::from_str(&fs::read_to_string(&policy_path)?)?;
+        assert!(!config.available_tools.contains(&CUSTOM_TOOL_NAME.to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_replaces_schema_and_runtime_dispatch() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry
+            .register_tool(
+                ToolRegistration::new(
+                    REPLACE_DISPATCH_TOOL_NAME,
+                    CapabilityLevel::CodeSearch,
+                    false,
+                    replacement_first_executor,
+                )
+                .with_description("first version")
+                .with_parameter_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "old": {"type": "string"}
+                    }
+                })),
+            )
+            .await?;
+        registry
+            .register_tool(
+                ToolRegistration::new(
+                    REPLACE_DISPATCH_TOOL_NAME,
+                    CapabilityLevel::CodeSearch,
+                    false,
+                    replacement_second_executor,
+                )
+                .with_description("second version")
+                .with_parameter_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "new": {"type": "string"}
+                    }
+                })),
+            )
+            .await?;
+        registry.allow_all_tools().await?;
+
+        let schema = registry
+            .get_tool_schema(REPLACE_DISPATCH_TOOL_NAME)
+            .await
+            .expect("replacement schema should be present");
+        assert_eq!(schema.pointer("/parameters/properties/new/type"), Some(&json!("string")));
+        assert!(schema.pointer("/parameters/properties/old").is_none());
+
+        let response = registry.execute_tool(REPLACE_DISPATCH_TOOL_NAME, json!({})).await?;
+        assert_eq!(response.get("version"), Some(&json!(2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_prevalidated_tool_path() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry
+            .register_tool(ToolRegistration::from_tool_instance(
+                CUSTOM_TOOL_NAME,
+                CapabilityLevel::CodeSearch,
+                CustomEchoTool,
+            ))
+            .await?;
+        registry.allow_all_tools().await?;
+
+        let args = json!({"input": "value"});
+        let response = registry.execute_tool_ref_prevalidated(CUSTOM_TOOL_NAME, &args).await?;
+        assert!(response["success"].as_bool().unwrap_or(false));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_exec_reuses_public_output_normalization() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let response = registry
+            .execute_harness_command_session(json!({
+                "action": "run",
+                "command": "printf vtcode",
+                "tty": false,
+                "yield_time_ms": 1000
+            }))
+            .await?;
+
+        assert_eq!(response["output"].as_str(), Some("vtcode"));
+        assert!(response.get("stdout").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_terminal_runs_retain_completed_sessions_until_close() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let response = registry
+            .execute_harness_command_session_terminal_run(json!({
+                "action": "run",
+                "command": ["/bin/sh", "-lc", "printf vtcode-terminal"],
+                "tty": true,
+                "yield_time_ms": 200,
+            }))
+            .await?;
+
+        let session_id = response["session_id"]
+            .as_str()
+            .expect("terminal run should expose session_id")
+            .to_string();
+        assert_eq!(response["exit_code"], 0);
+        assert_eq!(response["output"].as_str(), Some("vtcode-terminal"));
+        assert_eq!(registry.harness_exec_session_completed(&session_id).await?, Some(0));
+
+        registry.close_harness_exec_session(&session_id).await?;
+        registry.harness_exec_session_completed(&session_id).await.unwrap_err();
+
+        Ok(())
+    }
+
+    fn delayed_exec_args(tty: bool, yield_time_ms: u64) -> Value {
+        json!({
+            "cmd": "printf first && sleep 0.2 && printf second",
+            "tty": tty,
+            "yield_time_ms": yield_time_ms,
+        })
+    }
+
+    fn long_running_exec_args(tty: bool, yield_time_ms: u64) -> Value {
+        json!({
+            "cmd": "sleep 0.4 && printf second && sleep 0.4 && printf third && sleep 0.4 && printf done",
+            "tty": tty,
+            "yield_time_ms": yield_time_ms,
+        })
+    }
+
+    #[tokio::test]
+    async fn prevalidated_exec_mode_settles_noninteractive_run() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let response = registry
+            .execute_public_tool_ref_prevalidated_with_mode(
+                tools::EXEC_COMMAND,
+                &delayed_exec_args(false, 50),
+                ExecSettlementMode::SettleNonInteractive,
+            )
+            .await?;
+
+        let output = response["output"].as_str().expect("settled exec output should be text");
+        assert!(output.contains("first"));
+        assert!(output.contains("second"));
+        assert_eq!(response["exit_code"], 0);
+        assert!(response.get("next_continue_args").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prevalidated_exec_mode_settles_pipe_poll_until_exit() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let initial = registry.execute_harness_command_session(delayed_exec_args(false, 50)).await?;
+        let session_id = initial["session_id"]
+            .as_str()
+            .expect("partial run should expose session_id")
+            .to_string();
+        let initial_output = initial["output"].as_str().unwrap_or_default().to_string();
+        if initial.get("next_continue_args").is_none() {
+            assert_eq!(initial["exit_code"], 0);
+            assert!(initial_output.contains("first"));
+            assert!(initial_output.contains("second"));
+            return Ok(());
+        }
+        assert!(initial.get("exit_code").is_none());
+
+        let response = registry
+            .execute_public_tool_ref_prevalidated_with_mode(
+                tools::WRITE_STDIN,
+                &json!({
+                    "session_id": session_id,
+                    "chars": "",
+                    "yield_time_ms": 50,
+                }),
+                ExecSettlementMode::SettleNonInteractive,
+            )
+            .await?;
+
+        assert_eq!(response["exit_code"], 0);
+        let settled_output = response["output"].as_str().expect("settled poll output should be text");
+        assert!(initial_output.contains("second") || settled_output.contains("second"));
+        assert!(response.get("next_continue_args").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prevalidated_exec_mode_keeps_interactive_runs_manual() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let response = registry
+            .execute_public_tool_ref_prevalidated_with_mode(
+                tools::EXEC_COMMAND,
+                &long_running_exec_args(true, 50),
+                ExecSettlementMode::SettleNonInteractive,
+            )
+            .await?;
+
+        assert!(response.get("next_continue_args").is_some());
+        assert!(response.get("exit_code").is_none());
+
+        let session_id = response["session_id"]
+            .as_str()
+            .expect("interactive run should expose session_id")
+            .to_string();
+        registry
+            .execute_harness_command_session(json!({
+                "action": "close",
+                "session_id": session_id,
+            }))
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_session_run_preserves_requested_session_id_for_follow_up_calls() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let mut run_args = long_running_exec_args(true, 10);
+        run_args
+            .as_object_mut()
+            .expect("run args should be an object")
+            .insert("session_id".to_string(), json!("check_sh"));
+
+        let initial = registry.execute_harness_command_session(run_args).await?;
+        assert_eq!(initial["session_id"], "check_sh");
+        assert_eq!(initial["next_continue_args"], json!({ "session_id": "check_sh" }));
+
+        let response = registry
+            .execute_harness_command_session(json!({
+                "action": "poll",
+                "session_id": "check_sh",
+                "yield_time_ms": 10,
+            }))
+            .await?;
+
+        assert!(response.get("output").is_some());
+        assert!(response.get("exit_code").is_some() || response.get("next_continue_args").is_some());
+
+        if response.get("exit_code").is_none() {
+            registry
+                .execute_harness_command_session(json!({
+                    "action": "close",
+                    "session_id": "check_sh",
+                }))
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_exec_continuations_bypass_identical_call_loop_detection() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+        registry.execution_history.set_loop_detection_limits(5, 2);
+
+        let initial = registry
+            .execute_harness_command_session(long_running_exec_args(false, 10))
+            .await?;
+        let session_id = initial["session_id"]
+            .as_str()
+            .expect("partial run should expose session_id")
+            .to_string();
+        let continue_args = json!({
+            "session_id": session_id,
+            "chars": "",
+            "yield_time_ms": 10,
+        });
+
+        let first = registry
+            .execute_public_tool_ref_prevalidated(tools::WRITE_STDIN, &continue_args)
+            .await?;
+        assert_ne!(first.get("loop_detected"), Some(&json!(true)));
+
+        let second = registry
+            .execute_public_tool_ref_prevalidated(tools::WRITE_STDIN, &continue_args)
+            .await?;
+        assert_ne!(second.get("loop_detected"), Some(&json!(true)));
+
+        let third = registry
+            .execute_public_tool_ref_prevalidated(tools::WRITE_STDIN, &continue_args)
+            .await?;
+        assert_ne!(third.get("loop_detected"), Some(&json!(true)));
+        assert!(
+            third.get("exit_code").is_some() || third.get("next_continue_args").is_some(),
+            "continuation should either remain active or complete cleanly"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_session_accepts_compact_session_alias_for_poll() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let initial = registry
+            .execute_harness_command_session(long_running_exec_args(true, 10))
+            .await?;
+        let session_id = initial["session_id"]
+            .as_str()
+            .expect("partial run should expose session_id")
+            .to_string();
+
+        let response = registry
+            .execute_harness_command_session(json!({
+                "s": session_id,
+                "yield_time_ms": 10
+            }))
+            .await?;
+
+        assert!(response.get("output").is_some());
+        assert!(response.get("exit_code").is_some() || response.get("next_continue_args").is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_session_inspect_accepts_compact_session_alias() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let initial = registry
+            .execute_harness_command_session(long_running_exec_args(true, 10))
+            .await?;
+        let session_id = initial["session_id"]
+            .as_str()
+            .expect("partial run should expose session_id")
+            .to_string();
+
+        let response = registry
+            .execute_harness_command_session(json!({
+                "action": "inspect",
+                "s": session_id,
+                "head_lines": 1,
+                "tail_lines": 0
+            }))
+            .await?;
+
+        assert_eq!(response["content_type"], "exec_inspect");
+        assert!(response["output"].is_string());
+        assert!(response.get("session_id").is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutating_tools_clear_recent_read_reuse_history() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+        registry.execution_history.set_loop_detection_limits(5, 2);
+
+        let test_file = temp_dir.path().join("test.txt");
+        fs::write(&test_file, "original")?;
+
+        let read_args = json!({
+            "path": test_file.to_string_lossy(),
+            "max_bytes": 1000,
+        });
+        let write_args = json!({
+            "path": test_file.to_string_lossy(),
+            "content": "modified",
+            "mode": "overwrite",
+        });
+
+        let first = registry.execute_tool_ref(tools::READ_FILE, &read_args).await?;
+        assert_eq!(first["content"], "original");
+
+        let second = registry.execute_tool(tools::READ_FILE, read_args.clone()).await?;
+        assert_eq!(second["content"], "original");
+
+        let write_result = registry.execute_tool(tools::WRITE_FILE, write_args).await?;
+        assert_eq!(write_result["success"], json!(true));
+
+        let after_write = registry.execute_tool(tools::READ_FILE, read_args).await?;
+        assert_eq!(after_write["content"], "modified");
+        assert_ne!(after_write.get("reused_recent_result"), Some(&json!(true)));
+        assert_ne!(after_write.get("loop_detected"), Some(&json!(true)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_only_command_session_results_are_fast_reused() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let test_file = temp_dir.path().join("test.txt");
+        fs::write(&test_file, "hello")?;
+
+        let cat_args = json!({
+            "cmd": format!("cat {}", test_file.to_string_lossy()),
+        });
+
+        let first = registry.execute_tool_ref(tools::EXEC_COMMAND, &cat_args).await?;
+        assert!(first.get("reused_recent_result").is_none(), "first call should not be reused");
+
+        let second = registry.execute_tool_ref(tools::EXEC_COMMAND, &cat_args).await?;
+        assert_eq!(
+            second.get("reused_recent_result"),
+            Some(&json!(true)),
+            "second identical read-only exec call should reuse the first result"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_fetch_structured_errors_are_not_reused_as_successful_results() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let args = json!({
+            "url": "http://example.com",
+        });
+
+        let first = registry.execute_tool_ref(tools::WEB_FETCH, &args).await?;
+        assert!(
+            first
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("Only HTTPS URLs are allowed")),
+            "first web_fetch call should return the structured tool error"
+        );
+
+        let second = registry.execute_tool_ref(tools::WEB_FETCH, &args).await?;
+        assert!(
+            second.get("reused_recent_result").is_none(),
+            "failed web_fetch output must not be cached as a successful read-only result"
+        );
+        assert!(
+            second.get("loop_detected").is_none(),
+            "failed web_fetch output must not count toward identical successful-call loops"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prevalidated_execution_enforces_planning_workflow_guards() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+        registry.enable_planning();
+        registry.planning_workflow_state().enable();
+
+        let blocked_path = temp_dir.path().join("blocked.txt");
+        let args = json!({
+            "path": blocked_path.to_string_lossy().to_string(),
+            "content": "should-not-write"
+        });
+
+        let err = registry
+            .execute_tool_ref_prevalidated(tools::WRITE_FILE, &args)
+            .await
+            .expect_err("planning workflow should block prevalidated mutating tool call");
+        assert!(err.to_string().contains("planning workflow"));
+        assert!(!blocked_path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prevalidated_execution_allows_task_tracker_in_planning_workflow() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+        registry.enable_planning();
+        registry.planning_workflow_state().enable();
+
+        let plans_dir = temp_dir.path().join(".vtcode").join("plans");
+        fs::create_dir_all(&plans_dir)?;
+        let plan_file = plans_dir.join("adaptive-test.md");
+        fs::write(&plan_file, "# Adaptive test\n")?;
+        registry.planning_workflow_state().set_plan_file(Some(plan_file)).await;
+
+        let args = json!({"action": "create", "items": ["Track step"]});
+
+        let response = registry
+            .execute_tool_ref_prevalidated(tools::TASK_TRACKER, &args)
+            .await
+            .expect("task_tracker should be allowed in planning workflow");
+        assert_eq!(response["status"], "created");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_removed_exec_code_alias() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let err = registry
+            .preflight_validate_call(
+                "exec_code",
+                &json!({
+                    "command": "echo vtcode"
+                }),
+            )
+            .expect_err("exec_code alias should be rejected");
+        assert!(err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_removed_humanized_exec_label_alias() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let err = registry
+            .preflight_validate_call(
+                "Exec code",
+                &json!({
+                    "command": "echo vtcode"
+                }),
+            )
+            .expect_err("Exec code alias should be rejected");
+        assert!(err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_removed_execute_code_alias() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let err = registry
+            .preflight_validate_call(
+                tools::EXECUTE_CODE,
+                &json!({
+                    "code": "print('vtcode')"
+                }),
+            )
+            .expect_err("execute_code alias should be rejected");
+        assert!(err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_normalizes_raw_apply_patch_payload_to_input_object() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        let patch = "*** Begin Patch\n*** End Patch\n";
+
+        let outcome = registry.preflight_validate_call(tools::APPLY_PATCH, &json!(patch))?;
+
+        assert_eq!(outcome.normalized_tool_name, tools::APPLY_PATCH);
+        assert_eq!(outcome.effective_args, json!({ "input": patch }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_repo_browser_file_aliases() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let read_err = registry
+            .preflight_validate_call(
+                "repo_browser.read_file",
+                &json!({"path": "crates/codegen/vtcode-core/src/lib.rs"}),
+            )
+            .expect_err("repo_browser.read_file alias should be rejected");
+        assert!(read_err.to_string().contains("Unknown tool"));
+
+        let list_err = registry
+            .preflight_validate_call("repo_browser.list_files", &json!({"path": "crates/codegen/vtcode-core/src"}))
+            .expect_err("repo_browser.list_files alias should be rejected");
+        assert!(list_err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_removed_harness_browse_tool_routes() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let read_err = registry
+            .preflight_validate_call(tools::READ_FILE, &json!({"path": "crates/codegen/vtcode-core/src/lib.rs"}))
+            .expect_err("read_file should be rejected");
+        assert!(read_err.to_string().contains("Unknown tool"));
+
+        let list_err = registry
+            .preflight_validate_call(
+                tools::LIST_FILES,
+                &json!({"path": "crates/codegen/vtcode-core/src", "page": 1, "per_page": 20}),
+            )
+            .expect_err("list_files should be rejected");
+        assert!(list_err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_preflight_admits_hidden_file_helpers() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let read = registry
+            .preflight_validate_harness_call(
+                tools::READ_FILE,
+                &json!({"path": "crates/codegen/vtcode-core/src/lib.rs"}),
+            )
+            .expect("harness path should admit read_file");
+        assert_eq!(read.normalized_tool_name, tools::READ_FILE);
+
+        let list = registry
+            .preflight_validate_harness_call(tools::LIST_FILES, &json!({"path": "crates/codegen/vtcode-core/src"}))
+            .expect("harness path should admit list_files");
+        assert_eq!(list.normalized_tool_name, tools::LIST_FILES);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_preflight_rejects_non_allowlisted_hidden_tool() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        // `get_errors` is a registered, model-hidden builtin that is NOT in the
+        // harness-dispatchable allowlist. Even the harness path must reject it,
+        // so registering a new `with_llm_visibility(false)` tool cannot silently
+        // widen the dispatchable surface.
+        let err = registry
+            .preflight_validate_harness_call(tools::GET_ERRORS, &json!({}))
+            .expect_err("non-allowlisted hidden tool must not be harness-dispatchable");
+        assert!(err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_execution_rejects_hidden_file_helper_even_when_prevalidated() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        // The prevalidated flag is a performance hint (skip re-preflight) and is
+        // independent of dispatch authority. The direct model-public entry must
+        // still refuse model-hidden file helpers even with prevalidated=true, so
+        // a stray prevalidated flag can never widen the public surface.
+        let err = registry
+            .execute_public_tool_ref_prevalidated(
+                tools::READ_FILE,
+                &json!({"path": "crates/codegen/vtcode-core/src/lib.rs"}),
+            )
+            .await
+            .expect_err("model-public entry must reject read_file even when prevalidated");
+        assert!(err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_removed_planning_start_aliases() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let outcome = registry.preflight_validate_call(tools::START_PLANNING, &json!({}))?;
+        assert_eq!(outcome.normalized_tool_name, tools::START_PLANNING);
+
+        let tracker_outcome = registry.preflight_validate_call(tools::TASK_TRACKER, &json!({"action": "list"}))?;
+        assert_eq!(tracker_outcome.normalized_tool_name, tools::TASK_TRACKER);
+
+        let old_start_name = ["enter", "plan", "mode"].join("_");
+        let old_name = registry
+            .preflight_validate_call(&old_start_name, &json!({}))
+            .expect_err("old planning tool name should be rejected");
+        assert!(old_name.to_string().contains("Unknown tool"));
+
+        let old_tracker_name = ["plan", "task", "tracker"].join("_");
+        let old_alias = registry
+            .preflight_validate_call(&old_tracker_name, &json!({"action": "list"}))
+            .expect_err("removed planning alias should be rejected");
+        assert!(old_alias.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_removed_planning_finish_aliases() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let outcome = registry.preflight_validate_call(tools::FINISH_PLANNING, &json!({}))?;
+        assert_eq!(outcome.normalized_tool_name, tools::FINISH_PLANNING);
+
+        let old_finish_name = ["exit", "plan", "mode"].join("_");
+        let old_name = registry
+            .preflight_validate_call(&old_finish_name, &json!({}))
+            .expect_err("old planning tool name should be rejected");
+        assert!(old_name.to_string().contains("Unknown tool"));
+
+        let old_alias = registry
+            .preflight_validate_call("mode_edit", &json!({}))
+            .expect_err("removed planning alias should be rejected");
+        assert!(old_alias.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suggest_fallback_prefers_exec_command_for_exec_code_alias() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let fallback = registry.suggest_fallback_tool("exec_code").await;
+        assert_eq!(fallback.as_deref(), Some(tools::EXEC_COMMAND));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suggest_fallback_returns_none_for_humanized_exec_label() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let fallback = registry.suggest_fallback_tool("Exec code").await;
+        assert_eq!(fallback, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suggest_fallback_returns_none_for_task_tracker() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let fallback = registry.suggest_fallback_tool(tools::TASK_TRACKER).await;
+        assert!(fallback.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suggest_fallback_returns_none_for_unknown_tool() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        let fallback = registry.suggest_fallback_tool("not_a_real_tool").await;
+        assert!(fallback.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_public_repo_browser_alias_is_rejected() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        fs::write(temp_dir.path().join("public-route.txt"), "public route\n")?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let err = registry
+            .execute_public_tool_ref("repo_browser.read_file", &json!({"path": "public-route.txt"}))
+            .await
+            .expect_err("repo_browser.read_file should not resolve publicly");
+
+        assert!(err.to_string().contains("Unknown tool"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_tool_policy_accepts_current_public_names() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let policy_path = temp_dir.path().join("tool-policy.json");
+        let policy_manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        let registry = ToolRegistry::new_with_custom_policy(temp_dir.path().to_path_buf(), policy_manager).await;
+
+        registry.set_tool_policy(tools::EXEC_COMMAND, ToolPolicy::Deny).await?;
+
+        assert_eq!(registry.get_tool_policy(tools::EXEC_COMMAND).await, ToolPolicy::Deny);
+        assert_eq!(registry.get_tool_policy(tools::WRITE_STDIN).await, ToolPolicy::Allow);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_config_policies_applies_current_public_names() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let policy_path = temp_dir.path().join("tool-policy.json");
+        let policy_manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        let registry = ToolRegistry::new_with_custom_policy(temp_dir.path().to_path_buf(), policy_manager).await;
+
+        let mut config = ToolsConfig::default();
+        config.policies.clear();
+        config.policies.insert(tools::EXEC_COMMAND.to_string(), ToolPolicy::Allow);
+        config.policies.insert(tools::APPLY_PATCH.to_string(), ToolPolicy::Deny);
+
+        registry.apply_config_policies(&config).await?;
+
+        assert_eq!(registry.get_tool_policy(tools::EXEC_COMMAND).await, ToolPolicy::Allow);
+        assert_eq!(registry.get_tool_policy(tools::APPLY_PATCH).await, ToolPolicy::Deny);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_config_policies_includes_advanced_profile_tools() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let policy_path = temp_dir.path().join("tool-policy.json");
+        let policy_manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        let registry = ToolRegistry::new_with_custom_policy(temp_dir.path().to_path_buf(), policy_manager).await;
+
+        let mut config = ToolsConfig {
+            profile: ToolProfile::AdvancedVtCode,
+            ..ToolsConfig::default()
+        };
+        config.policies.insert(tools::CODE_SEARCH.to_string(), ToolPolicy::Deny);
+
+        registry.apply_config_policies(&config).await?;
+
+        assert_eq!(registry.get_tool_policy(tools::CODE_SEARCH).await, ToolPolicy::Deny);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persisted_approval_cache_round_trips_through_registry() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let policy_path = temp_dir.path().join("tool-policy.json");
+        let policy_manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        let registry = ToolRegistry::new_with_custom_policy(temp_dir.path().to_path_buf(), policy_manager).await;
+
+        registry.persist_approval_cache_key("read_file").await?;
+
+        assert!(registry.has_persisted_approval("read_file").await);
+
+        let manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        assert!(manager.has_approval_cache_key("read_file"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_alias_resolution_stays_consistent_across_execution_preflight_and_policy() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry
+            .register_tool(
+                ToolRegistration::from_tool_instance(CUSTOM_TOOL_NAME, CapabilityLevel::CodeSearch, CustomEchoTool)
+                    .with_description("Custom echo tool for routing parity tests")
+                    .with_parameter_schema(json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {"type": "string"}
+                        }
+                    }))
+                    .with_permission(ToolPolicy::Allow)
+                    .with_aliases(["custom tool"]),
+            )
+            .await?;
+
+        let preflight = registry.preflight_validate_call("Custom Tool", &json!({"input": "value"}))?;
+        assert_eq!(preflight.normalized_tool_name, CUSTOM_TOOL_NAME);
+
+        assert_eq!(registry.evaluate_tool_policy("Custom Tool").await?, ToolPermissionDecision::Allow);
+
+        let response = registry
+            .execute_public_tool_ref("Custom Tool", &json!({"input": "value"}))
+            .await?;
+        assert_eq!(response["success"].as_bool(), Some(true));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn safe_mode_prompt_uses_behavior_metadata() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+        registry.set_enforce_safe_mode_prompts(true).await;
+
+        assert_eq!(registry.evaluate_tool_policy(tools::CODE_SEARCH).await?, ToolPermissionDecision::Allow);
+        assert_eq!(registry.evaluate_tool_policy(tools::EXEC_COMMAND).await?, ToolPermissionDecision::Prompt);
+        assert_eq!(registry.evaluate_tool_policy(tools::APPLY_PATCH).await?, ToolPermissionDecision::Prompt);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_policy_paths_resolve_model_visible_aliases() -> Result<()> {
+        fn noop_executor<'a>(_registry: &'a ToolRegistry, _args: Value) -> BoxFuture<'a, Result<Value>> {
+            Box::pin(async { Ok(json!({"success": true})) })
+        }
+
+        let temp_dir = TempDir::new()?;
+        let policy_path = temp_dir.path().join("tool-policy.json");
+        let policy_manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        let registry = ToolRegistry::new_with_custom_policy(temp_dir.path().to_path_buf(), policy_manager).await;
+
+        let public_name = crate::tools::mcp::model_visible_mcp_tool_name("context7", "search");
+        registry
+            .register_tool(
+                ToolRegistration::new("mcp::context7::search", CapabilityLevel::Basic, false, noop_executor)
+                    .with_description("Fake MCP search tool")
+                    .with_parameter_schema(json!({"type": "object"}))
+                    .with_permission(ToolPolicy::Prompt)
+                    .with_aliases([public_name.clone()])
+                    .with_llm_visibility(false),
+            )
+            .await?;
+
+        registry
+            .mcp_tool_index
+            .write()
+            .await
+            .insert("context7".to_string(), vec!["search".to_string()]);
+        registry
+            .mcp_reverse_index
+            .write()
+            .await
+            .insert("search".to_string(), "context7".to_string());
+
+        registry.persist_mcp_tool_policy(&public_name, ToolPolicy::Allow).await?;
+
+        let manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(&policy_path).await?;
+        assert_eq!(manager.get_mcp_tool_policy("context7", "search"), ToolPolicy::Allow);
+
+        assert_eq!(registry.evaluate_tool_policy(&public_name).await?, ToolPermissionDecision::Allow);
+        assert_eq!(registry.evaluate_tool_policy("mcp::context7::search").await?, ToolPermissionDecision::Allow);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_alias_executes_without_recursive_reentry() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let patch = "*** Begin Patch\n*** Add File: patched_via_alias.txt\n+patched\n*** End Patch\n";
+        let response = registry.execute_tool(tools::APPLY_PATCH, json!({ "patch": patch })).await?;
+
+        assert_eq!(response.get("success").and_then(Value::as_bool), Some(true));
+        let expected_path = canonicalize(temp_dir.path().join("patched_via_alias.txt"))?
+            .to_string_lossy()
+            .into_owned();
+        let modified_files = response
+            .get("modified_files")
+            .and_then(Value::as_array)
+            .map_or(&[] as &[Value], |arr| arr)
+            .iter()
+            .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+            .filter_map(|p| canonicalize(p).ok())
+            .filter_map(|p| p.to_str().map(String::from))
+            .collect::<Vec<_>>();
+        assert_eq!(modified_files, vec![expected_path]);
+
+        let file_contents = fs::read_to_string(temp_dir.path().join("patched_via_alias.txt"))?;
+        assert_eq!(file_contents, "patched\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_reports_deduplicated_paths_for_every_successful_operation() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        fs::create_dir(temp_dir.path().join("src"))?;
+        fs::write(temp_dir.path().join("src/delete.rs"), "delete me\n")?;
+        fs::write(temp_dir.path().join("src/old.rs"), "old\n")?;
+        let canonical_base = canonicalize(temp_dir.path())?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let mut expected = ["add.rs", "delete.rs", "new.rs", "old.rs"]
+            .into_iter()
+            .map(|name| canonical_base.join("src").join(name).to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        expected.sort();
+
+        let patch = "*** Begin Patch\n*** Add File: src/add.rs\n+new\n*** Delete File: src/delete.rs\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n-old\n+new\n*** End Patch\n";
+        let response = registry.execute_tool(tools::APPLY_PATCH, json!({ "input": patch })).await?;
+
+        let modified_files = response
+            .get("modified_files")
+            .and_then(Value::as_array)
+            .map_or(&[] as &[Value], |arr| arr)
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect::<Vec<_>>();
+        assert_eq!(modified_files, expected);
+        assert!(temp_dir.path().join("src/add.rs").exists());
+        assert!(!temp_dir.path().join("src/delete.rs").exists());
+        assert!(!temp_dir.path().join("src/old.rs").exists());
+        assert_eq!(fs::read_to_string(temp_dir.path().join("src/new.rs"))?, "new\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_apply_patch_does_not_report_modified_files() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let outcome = registry
+            .execute_public_tool_request(ToolExecutionRequest::new(
+                tools::APPLY_PATCH,
+                json!({ "input": "*** Begin Patch\n*** Not An Operation\n*** End Patch\n" }),
+            ))
+            .await;
+
+        assert!(!outcome.is_success());
+        assert!(outcome.output.is_none());
+        assert!(
+            outcome
+                .error
+                .expect("failed patch should expose an error")
+                .to_json_value()
+                .get("modified_files")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_patch_accepts_input_payload() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let patch = "*** Begin Patch\n*** Add File: patched_via_input.txt\n+patched\n*** End Patch\n";
+        let response = registry.execute_tool(tools::APPLY_PATCH, json!({ "input": patch })).await?;
+
+        assert_eq!(response.get("success").and_then(Value::as_bool), Some(true));
+
+        let file_contents = fs::read_to_string(temp_dir.path().join("patched_via_input.txt"))?;
+        assert_eq!(file_contents, "patched\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_apply_patch_accepts_raw_string_payload() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        registry.allow_all_tools().await?;
+
+        let patch = "*** Begin Patch\n*** Add File: patched_via_raw_string.txt\n+patched\n*** End Patch\n";
+        let response = registry.execute_public_tool_ref(tools::APPLY_PATCH, &json!(patch)).await?;
+
+        assert_eq!(response.get("success").and_then(Value::as_bool), Some(true));
+
+        let file_contents = fs::read_to_string(temp_dir.path().join("patched_via_raw_string.txt"))?;
+        assert_eq!(file_contents, "patched\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_history_records_harness_context() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry.set_harness_session("session-history");
+        registry.set_harness_task(Some("task-history".to_owned()));
+
+        registry
+            .register_tool(ToolRegistration::from_tool_instance(
+                CUSTOM_TOOL_NAME,
+                CapabilityLevel::CodeSearch,
+                CustomEchoTool,
+            ))
+            .await?;
+        registry.allow_all_tools().await?;
+
+        let args = json!({"input": "value"});
+        let response = registry.execute_tool(CUSTOM_TOOL_NAME, args.clone()).await?;
+        assert!(response["success"].as_bool().unwrap_or(false));
+
+        let records = registry.get_recent_tool_records(1);
+        let record = records.first().expect("execution record captured");
+        assert_eq!(record.tool_name, CUSTOM_TOOL_NAME);
+        assert_eq!(record.context.session_id, "session-history");
+        assert_eq!(record.context.task_id.as_deref(), Some("task-history"));
+        assert_eq!(record.args, args);
+        assert!(record.success);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reentrancy_guard_blocks_recursive_tool_loops() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry
+            .register_tool(ToolRegistration::new(
+                REENTRANT_TOOL_NAME,
+                CapabilityLevel::CodeSearch,
+                false,
+                reentrant_tool_executor,
+            ))
+            .await?;
+        registry.allow_all_tools().await?;
+
+        let response = registry.execute_tool(REENTRANT_TOOL_NAME, json!({"input": "loop"})).await?;
+
+        assert_eq!(response.get("reentrant_call_blocked").and_then(Value::as_bool), Some(true));
+        assert_eq!(response.pointer("/error/error_type").and_then(Value::as_str), Some("PolicyViolation"));
+        assert!(
+            response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("REENTRANCY GUARD")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reentrancy_guard_blocks_cross_tool_cycles() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry
+            .register_tool(ToolRegistration::new(
+                MUTUAL_REENTRANT_TOOL_A,
+                CapabilityLevel::CodeSearch,
+                false,
+                mutual_reentrant_tool_a_executor,
+            ))
+            .await?;
+        registry
+            .register_tool(ToolRegistration::new(
+                MUTUAL_REENTRANT_TOOL_B,
+                CapabilityLevel::CodeSearch,
+                false,
+                mutual_reentrant_tool_b_executor,
+            ))
+            .await?;
+        registry.allow_all_tools().await?;
+
+        let response = registry
+            .execute_tool(MUTUAL_REENTRANT_TOOL_A, json!({"input": "cycle"}))
+            .await?;
+
+        assert_eq!(response.get("reentrant_call_blocked").and_then(Value::as_bool), Some(true));
+        assert_eq!(response.pointer("/error/error_type").and_then(Value::as_str), Some("PolicyViolation"));
+
+        let stack_trace = response.get("stack_trace").and_then(Value::as_str).unwrap_or_default();
+        assert!(stack_trace.contains(MUTUAL_REENTRANT_TOOL_A));
+        assert!(stack_trace.contains(MUTUAL_REENTRANT_TOOL_B));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_auto_allowlist_enforced() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry.enable_full_auto_permission(&[tools::EXEC_COMMAND.to_string()]).await;
+
+        assert!(registry.preflight_tool_permission(tools::EXEC_COMMAND).await?);
+        assert!(!registry.preflight_tool_permission(tools::READ_FILE).await?);
+        assert!(!registry.preflight_tool_permission(tools::RUN_PTY_CMD).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wildcard_initialisation_retains_registration_from_snapshot_window() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        let hooks = policy_catalogue_test_hooks(&registry).await;
+        let snapshot_pause = policy::PolicyCatalogueTestPause::default();
+        hooks.install_after_enable_snapshot(snapshot_pause.clone());
+
+        let enabling_registry = registry.clone();
+        let enable_task = tokio::spawn(async move {
+            enabling_registry
+                .enable_full_auto_permission_for_session(
+                    &[tools::WILDCARD_ALL.to_string()],
+                    advanced_session_tools_config(),
+                )
+                .await;
+        });
+        wait_for_catalogue_pause(&snapshot_pause).await;
+
+        let tool_name = "wildcard_snapshot_window_dynamic_tool";
+        let registering_registry = registry.clone();
+        let registration_task = tokio::spawn(async move {
+            registering_registry
+                .register_tool(
+                    ToolRegistration::new(tool_name, CapabilityLevel::Basic, false, catalogue_race_executor)
+                        .with_description("tool registered after the wildcard snapshot"),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !registry.has_tool(tool_name).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registration entered the wildcard snapshot window");
+        assert!(!registration_task.is_finished());
+
+        snapshot_pause.resume();
+        enable_task.await.expect("wildcard enable task");
+        registration_task.await.expect("registration task")?;
+
+        assert!(registry.is_allowed_in_full_auto(tool_name).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_flight_catalogue_refresh_cannot_restore_wildcard_after_disable() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        let config = advanced_session_tools_config();
+        registry
+            .enable_full_auto_permission_for_session(&[tools::WILDCARD_ALL.to_string()], config)
+            .await;
+
+        let hooks = policy_catalogue_test_hooks(&registry).await;
+        let refresh_pause = policy::PolicyCatalogueTestPause::default();
+        hooks.install_after_refresh_snapshot(refresh_pause.clone());
+        let registering_registry = registry.clone();
+        let registration_task = tokio::spawn(async move {
+            registering_registry
+                .register_tool(
+                    ToolRegistration::new(
+                        "disable_during_refresh_dynamic_tool",
+                        CapabilityLevel::Basic,
+                        false,
+                        catalogue_race_executor,
+                    )
+                    .with_description("tool whose registration pauses catalogue refresh"),
+                )
+                .await
+        });
+        wait_for_catalogue_pause(&refresh_pause).await;
+
+        let disable_pause = policy::PolicyCatalogueTestPause::default();
+        hooks.install_before_disable_lifecycle(disable_pause.clone());
+        let disabling_registry = registry.clone();
+        let mut disable_task = tokio::spawn(async move {
+            disabling_registry.disable_full_auto_permission().await;
+        });
+        wait_for_catalogue_pause(&disable_pause).await;
+        disable_pause.resume();
+        assert!(!registration_task.is_finished());
+        assert_catalogue_task_remains_pending(&mut disable_task, "disable task").await;
+
+        refresh_pause.resume();
+        registration_task.await.expect("registration task")?;
+        disable_task.await.expect("disable task");
+
+        assert_eq!(registry.current_full_auto_allowlist().await, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_flight_refresh_cannot_overwrite_same_config_explicit_replacement() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+        let config = advanced_session_tools_config();
+        registry
+            .enable_full_auto_permission_for_session(&[tools::WILDCARD_ALL.to_string()], config.clone())
+            .await;
+
+        let hooks = policy_catalogue_test_hooks(&registry).await;
+        let refresh_pause = policy::PolicyCatalogueTestPause::default();
+        hooks.install_after_refresh_snapshot(refresh_pause.clone());
+        let registering_registry = registry.clone();
+        let registration_task = tokio::spawn(async move {
+            registering_registry
+                .register_tool(
+                    ToolRegistration::new(
+                        "replacement_during_refresh_dynamic_tool",
+                        CapabilityLevel::Basic,
+                        false,
+                        catalogue_race_executor,
+                    )
+                    .with_description("tool whose registration pauses catalogue refresh"),
+                )
+                .await
+        });
+        wait_for_catalogue_pause(&refresh_pause).await;
+
+        let replacement_pause = policy::PolicyCatalogueTestPause::default();
+        hooks.install_before_enable_lifecycle(replacement_pause.clone());
+        let replacing_registry = registry.clone();
+        let mut replacement_task = tokio::spawn(async move {
+            replacing_registry
+                .enable_full_auto_permission_for_session(&[tools::EXEC_COMMAND.to_string()], config)
+                .await;
+        });
+        wait_for_catalogue_pause(&replacement_pause).await;
+        replacement_pause.resume();
+        assert!(!registration_task.is_finished());
+        assert_catalogue_task_remains_pending(&mut replacement_task, "replacement task").await;
+
+        refresh_pause.resume();
+        registration_task.await.expect("registration task")?;
+        replacement_task.await.expect("replacement task");
+
+        assert_eq!(registry.current_full_auto_allowlist().await, Some(vec![tools::EXEC_COMMAND.to_string()]));
+        assert!(
+            !registry
+                .is_allowed_in_full_auto("replacement_during_refresh_dynamic_tool")
+                .await
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_mcp_tool_identifiers() {
+        assert_eq!(normalize_mcp_tool_identifier("sequential-thinking"), "sequentialthinking");
+        assert_eq!(normalize_mcp_tool_identifier("Context7.Lookup"), "context7lookup");
+        assert_eq!(normalize_mcp_tool_identifier("alpha_beta"), "alphabeta");
+    }
+
+    #[test]
+    fn timeout_policy_derives_from_config() {
+        let config = TimeoutsConfig {
+            default_ceiling_seconds: 0,
+            pty_ceiling_seconds: 600,
+            mcp_ceiling_seconds: 90,
+            warning_threshold_percent: 75,
+            ..Default::default()
+        };
+
+        let policy = ToolTimeoutPolicy::from_config(&config);
+        assert_eq!(policy.ceiling_for(ToolTimeoutCategory::Default), None);
+        assert_eq!(policy.ceiling_for(ToolTimeoutCategory::Pty), Some(Duration::from_secs(600)));
+        assert_eq!(policy.ceiling_for(ToolTimeoutCategory::Mcp), Some(Duration::from_secs(90)));
+        assert!((policy.warning_fraction() - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn timeout_errors_are_structured_and_track_failures() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let registry = ToolRegistry::new(temp_dir.path().to_path_buf()).await;
+
+        registry
+            .register_tool(ToolRegistration::from_tool_instance(
+                SLOW_TIMEOUT_TOOL_NAME,
+                CapabilityLevel::CodeSearch,
+                SlowTimeoutTool,
+            ))
+            .await?;
+        registry.allow_all_tools().await?;
+
+        registry.apply_timeout_policy(&TimeoutsConfig {
+            default_ceiling_seconds: 1,
+            pty_ceiling_seconds: 1,
+            mcp_ceiling_seconds: 1,
+            ..Default::default()
+        });
+
+        let mut policy = ExecutionPolicySnapshot::default().with_max_retries(4);
+        policy.retry_base_delay = Duration::from_millis(1);
+        policy.retry_max_delay = Duration::from_millis(1);
+        policy.retry_multiplier = 1.0;
+
+        let request = ToolExecutionRequest::new(SLOW_TIMEOUT_TOOL_NAME, json!({})).with_policy(policy);
+        let outcome = registry.execute_public_tool_request(request).await;
+
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.attempts, 5);
+
+        let error = outcome.error.expect("timeout outcome should include error");
+        assert_eq!(error.tool_name, SLOW_TIMEOUT_TOOL_NAME);
+        assert!(matches!(error.error_type, ToolErrorType::Timeout));
+        assert_eq!(error.category, vtcode_commons::ErrorCategory::Timeout);
+        assert!(error.is_recoverable);
+        assert!(error.retry_after_ms.is_some());
+        assert!(error.message.contains("exceeded the standard timeout ceiling"));
+        assert_eq!(error.debug_context.as_ref().and_then(|ctx| ctx.surface.as_deref()), Some("tool_registry"));
+
+        let failures = registry.execution_history.get_recent_failures(1);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].timeout_category.as_deref(), Some("standard"));
+        assert_eq!(failures[0].effective_timeout_ms, Some(1_000));
+
+        let consecutive_failures = registry
+            .resiliency
+            .lock()
+            .failure_trackers
+            .get(&ToolTimeoutCategory::Default)
+            .map(|tracker| tracker.consecutive_failures)
+            .unwrap_or(0);
+        assert_eq!(consecutive_failures, 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn code_search_executes_with_policy_capped_max_results() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        fs::write(temp_dir.path().join("Widget.rs"), "struct Widget;\n")?;
+        let policy_path = temp_dir.path().join("tool-policy.json");
+        let mut config = ToolPolicyConfig::default();
+        config.policies.insert(tools::CODE_SEARCH.to_string(), ToolPolicy::Allow);
+        config.constraints.insert(
+            tools::CODE_SEARCH.to_string(),
+            ToolConstraints {
+                max_results_per_call: Some(1),
+                ..ToolConstraints::default()
+            },
+        );
+        fs::write(&policy_path, serde_json::to_vec_pretty(&config)?)?;
+        let policy_manager = crate::tool_policy::ToolPolicyManager::new_with_config_path(policy_path).await?;
+        let registry = ToolRegistry::new_with_custom_policy(temp_dir.path().to_path_buf(), policy_manager).await;
+
+        let response = registry
+            .execute_tool(
+                tools::CODE_SEARCH,
+                json!({
+                    "query": "Widget",
+                    "path": ".",
+                    "result_types": ["path"],
+                    "max_results": 50
+                }),
+            )
+            .await?;
+
+        assert_eq!(response["filters"]["max_results"], json!(1));
+        assert_eq!(response["returned"], json!(1));
+        assert_eq!(response["results"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+}

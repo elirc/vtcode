@@ -1,0 +1,381 @@
+# VT Code Documentation Hub
+
+Welcome to the comprehensive documentation for **VT Code**, a Rust-based terminal coding agent with modular architecture supporting multiple LLM providers and advanced code analysis capabilities.
+
+## Quick Installation
+
+[![Crates.io](https://img.shields.io/crates/v/vtcode.svg)](https://crates.io/crates/vtcode)
+[![Homebrew](https://img.shields.io/badge/dynamic/json?url=https://formulae.brew.sh/api/formula/vtcode.json&query=$.versions.stable&label=homebrew)](https://formulae.brew.sh/formula/vtcode)
+[![GitHub release](https://img.shields.io/github/release/vinhnx/vtcode.svg)](https://github.com/vinhnx/vtcode/releases)
+
+### Choose Your Installation Method
+
+#### Cargo (Recommended)
+
+```bash
+cargo install vtcode
+```
+
+[API Documentation](https://docs.rs/vtcode) | [Crates.io](https://crates.io/crates/vtcode)
+
+#### Homebrew (macOS)
+
+```bash
+brew install vinhnx/tap/vtcode
+```
+
+[Homebrew Formula](https://formulae.brew.sh/formula/vtcode)
+
+#### Pre-built Binaries
+
+Download from [GitHub Releases](https://github.com/vinhnx/vtcode/releases) for Linux, macOS, or Windows.
+
+## What Makes VT Code Special
+
+VT Code represents a modern approach to AI-powered software development, featuring:
+
+- **Single-Agent Reliability (default)** - Streamlined, linear agent with robust context engineering
+- **Decision Ledger** - Structured, compact record of key decisions injected each turn for consistency
+- **Error Recovery & Resilience** - Intelligent error handling with pattern detection and context preservation
+- **Conversation Summarization** - Automatic compression when exceeding thresholds with quality assessment
+- **Multi-Provider LLM Support** - 21+ providers including Gemini, OpenAI, Anthropic, DeepSeek, OpenRouter, Evolink, Qwen, StepFun, Poolside, Ollama, LM Studio, Xiaomi MiMo, Z.AI, Moonshot, MiniMax, HuggingFace
+- **LLM-Native Code Understanding** - Precise semantic analysis across all modern languages
+- **Bash Safety Parsing** - Accurate shell command validation via tree-sitter-bash
+- **Enterprise-Grade Safety** - Comprehensive security controls and path validation
+- **Flexible Configuration** - TOML-based configuration with granular policies
+- **Workspace-First Execution** - Full read/write/command capabilities anchored to `WORKSPACE_DIR` with built-in indexing workflows
+
+## Documentation Overview
+
+This documentation is organized to support different user personas and use cases:
+
+### Recent Major Enhancements
+
+VT Code has undergone significant improvements:
+
+- **Loop Engineering** - Worktree isolation for parallel agents, propose/verify sub-agent separation, durable loop state persistence (`.vtcode/state/`), and token-cost guardrails. See [Loop Engineering](./loop-engineering.md).
+
+- **Planning Workflow** - Iterate on a build plan with `/plan` and the `plan` primary agent. The agent can propose planning itself via an "Enter Planning workflow?" confirmation prompt, and you steer it with intent phrases (`approve`/`implement` to exit, `stay in planning` to remain). Approve via a structured review gate and hand off to `build`/`auto`. See [Planning Workflow](./guides/planning-workflow.md).
+- **Primary Agent Switching & Mode Guard** - Switch main-session agents (`plan`/`build`/`auto`) with `Tab`; mode switches lock during a turn to keep tool-access and instructions consistent.
+- **Automatic Compaction & Memory Envelope** - Unified compaction orchestration with a shared memory envelope as the single source of truth for both runloops.
+- **`/checkup` Command** - Configuration diagnostics that surface reversible, confirm-before-apply optimizations (e.g. tool-result clearing, client tool search, token-efficiency warnings).
+- **GPT-5.6 Models** - Added support for OpenAI's GPT-5.6 family across configurations.
+
+- **GLM-5.2 Model Support** - Zhipu AI's latest model with cache metrics in stream handling
+- **Byte-Range File Reading** - Large file reading with offset and page size parameters for efficient partial reads
+- **Kimi K2.7 Code Model** - Moonshot's latest code-focused model across all configurations
+- **GPT-5-Codex Integration** - OpenAI's Codex model with Responses API support
+- **Cross-Platform Process Groups** - Proper process group management on Windows via platform-specific APIs
+- **Signal Handling Architecture** - Comprehensive Ctrl+C / SIGINT priority guarantees with double-Ctrl+C emergency exit
+- **Compile-Time Tool Validation** - Pre-main validation of tool name constants for early error detection
+- **Provider Stream Refactoring** - Simplified stream handling across DeepSeek, StepFun, and ZAI providers
+- **Decision Transparency System** - Complete audit trail with reasoning and confidence scores
+- **Error Recovery & Resilience** - Intelligent error handling with pattern detection and multiple recovery strategies
+- **Advanced Code Search** - Bounded definitions, syntactic usages, literal text, and matching paths through `code_search` in the advanced VT Code profile
+- **Web Search & Fetch** — `web_search` and `defuddle_fetch` tools with TOML-driven network allowlist and domain-scoped approval caching
+- **Post-Tool Recovery Cycles** — Automatic detection and cap enforcement for post-tool recovery loops with temporary file cleanup
+- **CLI `did you mean?`** — Fuzzy suggestions for unrecognized commands with colorized output
+- **Session Resume** — `/continue` slash command to resume the most recent session
+- **Loop Detection Hardening** — Blocked-streak fuse prevents false positives; read-extent-aware duplicate detection
+
+See [CHANGELOG](../CHANGELOG.md) for complete details on these improvements.
+
+### For Users
+
+New to VT Code? Start with installation and basic usage:
+
+- **[Getting Started](./user-guide/getting-started.md)** - Installation, configuration, and first steps
+- **[Subagents](./user-guide/subagents.md)** - Create, configure, invoke, and switch between delegated child agents with VT Code-native tool metadata
+- **[Interactive Mode Reference](./user-guide/interactive-mode.md)** - Keyboard shortcuts and terminal workflows
+- **[Scheduled Tasks](./user-guide/scheduled-tasks.md)** - Reminders and durable `vtcode schedule` automations
+- [Decision Ledger](./context/context_engineering.md#4-decision-ledger-structured-note-taking) - How decisions are tracked and injected
+- **[Configuration Guide](./config/config.md)** - Comprehensive configuration options
+- **[Status Line Configuration](./guides/status-line.md)** - Customize the inline prompt footer
+- **[Responses API & Reasoning Models](./guides/responses-api-reasoning.md)** - Align reasoning-centric prompts with the OpenAI Responses API
+- **[External Editor Configuration](./tools/EDITOR_CONFIG.md)** - Setup and usage of the `/edit` command with your preferred editor
+
+### For Developers
+
+Contributing to VT Code? Understand the architecture and development processes:
+
+- **[Architecture Overview](./ARCHITECTURE.md)** - System design and core components
+- **[Development Guide](./development/README.md)** - Development environment setup
+- **[Tool Reference](./tools/TOOL_SPECS.md)** - Technical reference for built-in tools
+- **[AI Tool Surface Migration](./development/ai-tool-surface-migration.md)** - Breaking-change notes for the Codex-style default tools
+- **[Web Search Tool](./tools/web_search.md)** - Web search configuration and guard rails
+- **[Defuddle Fetch](./tools/defuddle_fetch.md)** - Markdown extraction fallback for complex pages
+- **[Code Standards](../.github/copilot-instructions.md)** - Coding guidelines and best practices
+- **[Memory Management](./guides/memory-management.md)** - Configure authored guidance, `.vtcode/rules/`, and per-repository persistent memory
+
+### For Organizations
+
+Deploying VT Code in production? Focus on enterprise features:
+
+- **[Security Model](./security/SECURITY_MODEL.md)** - Multi-layered security architecture
+- **[Security Documentation Index](./security/SECURITY_DOCUMENTATION_INDEX.md)** - Security document map and references
+- **[Process Hardening](./development/PROCESS_HARDENING.md)** - Security controls and runtime hardening
+- **[Performance Analysis](./benchmarks/README.md)** - Optimization and benchmarking
+- **[Provider Guides](./providers/PROVIDER_GUIDES.md)** - LLM provider integration guides
+    - [OpenRouter Integration](./providers/openrouter.md)
+    - [llama.cpp Provider Guide](./providers/llamacpp.md)
+
+## Core Capabilities
+
+### Context Engineering
+
+- **Decision Ledger** - Persistent, compact history of key decisions and constraints
+- **Error Recovery** - Intelligent error handling with pattern detection and context preservation
+- **Smart Summarization (EXPERIMENTAL)** - Automatic conversation compression with importance scoring, semantic similarity detection, and advanced error analysis (disabled by default)
+- **Conversation Summarization** - Automatic compression for long sessions with quality scoring
+- **Context Compression** - Summarizes older turns while preserving ledger, errors, and recent activity
+- **Tool Traces** - Tool inputs/outputs summarized and fed back for continuity
+
+### LLM-Native Code Understanding
+
+- **Semantic Analysis** - Deep code understanding across Rust, Python, JavaScript, TypeScript, Go, Java, and more
+- **Bash Safety Parsing** - Tree-sitter-bash for critical shell command validation
+- **Intelligent Search** - Ripgrep shell search through `exec_command.cmd` and focused literal `code_search` in the advanced profile
+- **Fuzzy File Discovery** - Git-aware traversal using `ignore` with `nucleo-matcher` scoring
+- **Symbol Analysis** - LLM-native function, class, and variable extraction
+- **Dependency Mapping** - Import relationship analysis
+- **Code Quality Assessment** - Complexity and maintainability scoring via AI analysis
+
+### Comprehensive Tool Suite
+
+- **File Operations** - Safe, validated file system operations
+- **Terminal Integration** - Enhanced PTY support with color-coded tool/MCP status banners and interactive commands
+- **Search & Analysis** - Fast shell search through `rg`, plus advanced bounded code search through `code_search`
+- **Batch Processing** - Efficient multi-file operations
+- **Configuration Management** - Dynamic TOML-based settings
+- **GPU Pod Manager** - Remote model pod lifecycle management over SSH ([feature guide](./features/GPU_POD_MANAGER.md))
+
+### Safety & Security
+
+VT Code implements a **multi-layered security model** to protect against prompt injection and argument injection attacks:
+
+- **Execution Policy** - Command allowlist with per-command argument validation (only 9 safe commands allowed)
+- **Argument Injection Protection** - Explicit blocking of dangerous flags (e.g., `--pre`, `-exec`, `-e`)
+- **Workspace Isolation** - All operations confined to workspace boundaries with symlink resolution
+- **Sandbox Integration** - Optional Anthropic sandbox runtime for network commands
+- **Human-in-the-Loop** - Three-tier approval system (once/session/permanent)
+- **Path Validation** - Prevents access outside workspace with comprehensive traversal checks
+- **Command Policies** - Allow/deny lists with pattern matching
+- **Audit Trail** - Comprehensive logging of all command executions
+- **File Size Limits** - Configurable resource constraints
+- **API Key Security** - Secure credential management
+
+**[Security Documentation Index](./security/SECURITY_DOCUMENTATION_INDEX.md)** - Security docs at a glance
+**[Security Model](./security/SECURITY_MODEL.md)** - Complete security architecture
+**[Security Web Fetch](./security/SECURITY_WEB_FETCH.md)** - Web fetch security model and controls
+**[Security Guide](./guides/security.md)** - Best practices and configuration
+**[Tool Policies](./modules/vtcode_tools_policy.md)** - Command execution policies
+
+## Quick Start Guide
+
+### For New Users
+
+1. **[Installation](../README.md#installation)** - Get VT Code running in minutes
+2. **[Basic Configuration](./config/config.md)** - Set up your environment
+3. **[First Chat Session](../README.md#quick-start)** - Try interactive coding assistance
+
+### For Developers
+
+1. **[Architecture Overview](./ARCHITECTURE.md)** - Understand the system design
+2. **[Development Setup](./development/README.md)** - Configure development environment
+3. **[Decision Ledger](./context/context_engineering.md#4-decision-ledger-structured-note-taking)** - Learn decision tracking and context engineering
+
+### For Organizations
+
+1. **[Security Implementation](./development/PROCESS_HARDENING.md)** - Enterprise security features
+2. **[Provider Integration](./providers/PROVIDER_GUIDES.md)** - LLM provider setup (Gemini, OpenAI, Anthropic, OpenRouter)
+3. **[Performance Tuning](./benchmarks/README.md)** - Optimization strategies
+
+## Usage Patterns
+
+### Usage Notes
+
+**Trajectory Logs:**
+Logs for trajectory: check `.vtcode/logs/trajectory.jsonl`.
+
+### Workspace-First Operations
+
+- `WORKSPACE_DIR` always points to the active project root; treat it as the default scope for every command and edit.
+- Use targeted indexing (directory walks, dependency introspection, metadata extraction) before large changes to stay aligned with the current codebase.
+- Keep shell commands and scripts within the workspace unless the workflow explicitly requires external paths.
+- Ask for confirmation before operating outside `WORKSPACE_DIR` or when interacting with untrusted downloads.
+- Launch sessions against another repository with `vtcode /abs/path`; you can also pass `--workspace-dir` (alias: `--workspace`) to other commands when needed.
+
+### Single-Agent Workflows
+
+```bash
+# Complex task execution with Decision Ledger
+./run.sh chat "Implement user authentication system"
+
+# Codebase analysis
+./run.sh analyze
+```
+
+### Configuration Management
+
+```bash
+# Initialize project configuration
+./run.sh init
+
+# Generate complete configuration (preserves existing settings)
+./run.sh config
+
+# Generate configuration to custom file
+./run.sh config --output my-config.toml
+
+# Edit configuration interactively
+./run.sh config --edit
+
+# Validate configuration
+./run.sh config --validate
+```
+
+**Smart Configuration Generation**: The `config` command implements two-way synchronization that reads your existing `vtcode.toml` and generates a complete template while preserving all your customizations.
+
+## Benchmarks & Performance
+
+VT Code is evaluated on industry-standard benchmarks to measure code generation quality and performance:
+
+### HumanEval Results
+
+**Latest:** `gemini-3-flash-preview` achieves **61.6% pass@1** on the complete HumanEval dataset (164 tasks)
+
+| Metric         | Value             |
+| -------------- | ----------------- |
+| Pass@1         | 61.6%             |
+| Median Latency | 0.973s            |
+| P90 Latency    | 1.363s            |
+| Cost           | $0.00 (free tier) |
+
+**[View Full Benchmark Results](./benchmarks/HUMANEVAL_2025-10-22.md)**
+**[Model Comparison](./benchmarks/COMPARISON.md)**
+**[Run Your Own Benchmarks](./benchmarks/README.md)**
+
+### Running Benchmarks
+
+```bash
+# Run full HumanEval benchmark
+make bench-humaneval PROVIDER=gemini MODEL='gemini-3-flash-preview'
+
+# Compare multiple models
+python3 scripts/compare_benchmarks.py reports/HE_*.json
+
+# Generate visualizations
+python3 scripts/generate_benchmark_chart.py reports/HE_*.json --png
+```
+
+## Testing & Quality Assurance
+
+VT Code includes comprehensive testing infrastructure:
+
+### Test Categories
+
+- **Unit Tests** - Component-level testing with `cargo test`
+- **Integration Tests** - End-to-end workflow validation
+- **Performance Tests** - Benchmarking with `cargo bench`
+- **Configuration Tests** - TOML validation and policy testing
+- **Code Generation Benchmarks** - HumanEval and other standard benchmarks
+
+### Quality Assurance
+
+```bash
+# Run full test suite
+cargo test --workspace
+
+# Run with coverage
+cargo tarpaulin
+
+# Performance benchmarking
+cargo bench
+
+# Code generation benchmarks
+make bench-humaneval
+
+# Linting and formatting
+cargo clippy && cargo fmt
+```
+
+## Project Information
+
+### Current Status & Roadmap
+
+- **[Roadmap](./project/ROADMAP.md)** - Future development plans and milestones
+- **[Changelog](../CHANGELOG.md)** - Version history and release notes
+
+### Development Resources
+
+- **[Contributing Guide](./CONTRIBUTING.md)** - How to contribute
+- **[Code Standards](../.github/copilot-instructions.md)** - Coding guidelines
+- **[Architecture Decisions](./ARCHITECTURE.md)** - Design rationale
+
+## Support & Community
+
+### Getting Help
+
+- **GitHub Issues** - Report bugs and request features
+- **GitHub Discussions** - Community discussions and support
+- **Documentation** - Comprehensive guides and tutorials
+
+### Community Resources
+
+- **[Main README](../README.md)** - Project overview and quick reference
+- **[GitHub Repository](https://github.com/vinhnx/vtcode)** - Source code and collaboration
+- **[Discussions](https://github.com/vinhnx/vtcode/discussions)** - Community support
+
+### Enterprise Support
+
+- **Security Features** - Enterprise-grade security controls
+- **Single-Agent Coordination** - Reliable workflow orchestration with Decision Ledger
+- **Provider Integration** - Multiple LLM provider support
+- **Performance Optimization** - Enterprise-scale performance tuning
+
+## License & Attribution
+
+This documentation is part of the VT Code project, licensed under
+**MIT OR Apache-2.0**. See the main [README](../README.md) for details.
+
+### Third-Party Attribution
+
+VT Code builds upon key developments in AI agent technology:
+
+- **OpenAI Codex** (Apache-2.0) — OAuth flow, PTY process handling, MCP client
+  architecture, Ollama and LM Studio provider integrations, tool handler
+  patterns. See [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) for details.
+  Source: <https://github.com/openai/codex>
+- **Anthropic's Agent Patterns** - Tool design and safety principles
+- **Cognition's Context Engineering** - Long-running agent reliability and Decision Ledger
+- **Single-Agent Architecture** - Reliable coordination patterns
+- **Tree-Sitter Bash Grammar** - Critical shell command validation
+- **Rust Community** - High-performance systems programming
+
+---
+
+**Documentation Version:** 3.1.0
+**Last Updated:** June 28, 2026
+**VT Code Version:** 0.133.21
+
+**Ready to get started?** **[Installation Guide](../README.md#quick-start)**
+
+## Documentation Version
+
+This documentation reflects version 0.133.21 of VT Code, which includes significant enhancements including:
+
+- GLM-5.2, Kimi K2.7, and GPT-5-Codex model support
+- Byte-range file reading for large files
+- Cross-platform process group management
+- Signal handling architecture with emergency exit
+- Decision Ledger system for transparent decision tracking
+- Error recovery and resilience with intelligent pattern detection
+- Conversation summarization for long-running sessions
+- Enhanced Terminal User Interface (TUI) with improved mouse support and text selection
+- `web_search` and `defuddle_fetch` tools with TOML-driven network allowlist
+- query-led `code_search` for definitions, syntactic usages, literal text, and matching paths in the advanced VT Code profile
+- Post-tool recovery cycle tracking with cap checks and temporary file cleanup
+- CLI `did you mean?` suggestions for unrecognized commands
+- `/continue` command to resume the most recent session
+- Loop detection improvements with blocked-streak fuse and read-extent awareness
+- Colorized CLI suggestions and case-insensitive `StatusLineMode` deserialization

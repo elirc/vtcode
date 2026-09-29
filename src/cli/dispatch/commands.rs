@@ -1,0 +1,289 @@
+use crate::startup::StartupContext;
+use anyhow::Result;
+use vtcode_core::cli::args::{Cli, Commands};
+use vtcode_core::mcp::cli::handle_mcp_command;
+
+use super::run::{
+    handle_analyze_command, handle_ask_single_command, handle_chat_command, handle_resume_session_command,
+};
+use super::skills::dispatch_skills_command;
+use crate::cli::acp::handle_acp_command;
+use crate::cli::adapters::{ask_options, skills_options};
+use crate::cli::anthropic_api::handle_anthropic_api_command;
+use crate::cli::app_server::handle_app_server_command;
+use crate::cli::bench_allocator::handle_bench_allocator_command;
+use crate::cli::session_store::handle_session_store_command;
+use crate::cli::{
+    analyze, benchmark, check, config, create_project, dependencies, exec, init, init_project, man, notify, revert,
+    review, schedule, schema, skills, snapshots, trajectory, update,
+};
+
+pub(crate) async fn dispatch_command(args: &Cli, startup: &StartupContext, command: Commands) -> Result<()> {
+    let cfg = &startup.config;
+    let core_cfg = &startup.agent_config;
+    let skip_confirmations = startup.skip_confirmations;
+    let full_auto_requested = startup.full_auto_requested;
+
+    // Register OpenAI-compatible custom providers for non-interactive CLI flows
+    // such as `ask`, `review`, and `benchmark` before any provider is resolved.
+    vtcode_core::llm::factory::register_custom_providers(&cfg.custom_providers);
+
+    match command {
+        Commands::AgentClientProtocol { target } => {
+            handle_acp_command(core_cfg, cfg, target).await?;
+        }
+        Commands::ToolPolicy { command } => {
+            vtcode_core::cli::tool_policy_commands::handle_tool_policy_command(command).await?;
+        }
+        Commands::Mcp { command } => {
+            handle_mcp_command(command).await?;
+        }
+        Commands::A2a { command } => {
+            vtcode_core::cli::a2a::execute_a2a_command(command).await?;
+        }
+        Commands::AppServer { listen } => {
+            handle_app_server_command(core_cfg, cfg, &listen).await?;
+        }
+        Commands::Models { command } => {
+            vtcode_core::cli::models_commands::handle_models_command(args, &command).await?;
+        }
+        Commands::Pods { command } => {
+            vtcode_core::cli::pods_commands::handle_pods_command(command).await?;
+        }
+        Commands::Continue => {
+            // `continue` is normally intercepted in `resolve_action` and turned
+            // into a resume-latest action. Handle it defensively here too so the
+            // subcommand keeps working if the resolution path changes.
+            let mode = if startup.custom_session_id.is_some() {
+                crate::startup::SessionResumeMode::Fork("__latest__".to_string())
+            } else {
+                crate::startup::SessionResumeMode::Latest
+            };
+            handle_resume_session_command(
+                core_cfg,
+                mode,
+                startup.resume_show_all,
+                startup.custom_session_id.clone(),
+                startup.summarize_fork,
+                skip_confirmations,
+            )
+            .await?;
+        }
+        Commands::Chat | Commands::ChatVerbose => {
+            handle_chat_command(
+                core_cfg.clone(),
+                startup.config.clone(),
+                skip_confirmations,
+                full_auto_requested,
+                startup.primary_agent_explicitly_configured,
+                startup.planning_entry_source,
+            )
+            .await?;
+        }
+        Commands::Ask { prompt, output_format } => {
+            handle_ask_single_command(
+                core_cfg.clone(),
+                Some(cfg.clone()),
+                prompt,
+                ask_options(args, output_format, skip_confirmations),
+            )
+            .await?;
+        }
+        Commands::Exec {
+            json,
+            dry_run,
+            events,
+            last_message_file,
+            command,
+            prompt,
+        } => {
+            let command = exec::resolve_exec_command(command, prompt)?;
+            let options = exec::ExecCommandOptions {
+                json,
+                dry_run,
+                events_path: events,
+                last_message_file,
+                command,
+                primary_agent_explicitly_configured: startup.primary_agent_explicitly_configured,
+            };
+            exec::handle_exec_command(core_cfg, cfg, options).await?;
+        }
+        Commands::Schedule { command } => {
+            schedule::handle_schedule_command(startup, command).await?;
+        }
+        Commands::BackgroundSubagent(args) => {
+            crate::cli::background_subagent::handle_background_subagent_command(startup, args).await?;
+        }
+        Commands::Review(review) => {
+            let files = review.files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>();
+            let spec = vtcode_core::review::build_review_spec(
+                review.last_diff,
+                review.target.clone(),
+                files,
+                review.style.clone(),
+            )?;
+            let options = review::ReviewCommandOptions {
+                json: review.json,
+                events_path: review.events.clone(),
+                last_message_file: review.last_message_file.clone(),
+                spec,
+                primary_agent_explicitly_configured: startup.primary_agent_explicitly_configured,
+            };
+            review::handle_review_command(core_cfg, cfg, options).await?;
+        }
+        Commands::Schema { command } => {
+            print!("{}", dispatch_schema_command(command, cfg).await?);
+        }
+        Commands::Analyze { analysis_type } => {
+            handle_analyze_command(
+                core_cfg.clone(),
+                Some(cfg.clone()),
+                analyze::AnalysisType::from_cli_arg(&analysis_type),
+            )
+            .await?;
+        }
+        Commands::Trajectory { file, top } => {
+            trajectory::handle_trajectory_command(core_cfg, file, top).await?;
+        }
+        Commands::SessionStore { command } => {
+            handle_session_store_command(command).await?;
+        }
+        Commands::Notify { title, message } => {
+            notify::handle_notify_command(startup, title, message).await?;
+        }
+        Commands::CreateProject { name, features } => {
+            create_project::handle_create_project_command(core_cfg, &name, &features).await?;
+        }
+        Commands::Revert { turn, partial } => {
+            revert::handle_revert_command(core_cfg, turn, partial).await?;
+        }
+        Commands::Snapshots => {
+            snapshots::handle_snapshots_command(core_cfg).await?;
+        }
+        Commands::CleanupSnapshots { max } => {
+            snapshots::handle_cleanup_snapshots_command(core_cfg, Some(max)).await?;
+        }
+        Commands::Init { force } => {
+            init::handle_init_command(&startup.workspace, force, false).await?;
+        }
+        Commands::Config { output, global } => {
+            config::handle_config_command(output.as_deref(), global).await?;
+        }
+        Commands::Login { provider, device_code } => {
+            crate::cli::auth::handle_login_command(Some(cfg), &provider, device_code).await?;
+        }
+        Commands::Logout { provider } => {
+            crate::cli::auth::handle_logout_command(Some(cfg), &provider).await?;
+        }
+        Commands::Auth { provider } => {
+            crate::cli::auth::handle_show_auth_command(Some(cfg), provider.as_deref()).await?;
+        }
+        Commands::InitProject { name, force, migrate } => {
+            init_project::handle_init_project_command(name, force, migrate).await?;
+        }
+        Commands::Benchmark { task_file, task, output, max_tasks } => {
+            let options = benchmark::BenchmarkCommandOptions { task_file, inline_task: task, output, max_tasks };
+            benchmark::handle_benchmark_command(core_cfg, cfg, options, full_auto_requested).await?;
+        }
+        Commands::Man { command, output } => {
+            man::handle_man_command(command, output).await?;
+        }
+        Commands::BenchAllocator(args) => {
+            handle_bench_allocator_command(args).await?;
+        }
+        Commands::ListSkills {} => {
+            let skills_options = skills_options(startup);
+            skills::handle_skills_list(&skills_options).await?;
+        }
+        Commands::Dependencies(command) => {
+            dependencies::handle_dependencies_command(command).await?;
+        }
+        Commands::Check { command } => {
+            check::handle_check_command(&startup.workspace, command).await?;
+        }
+        Commands::Skills(skills_cmd) => {
+            dispatch_skills_command(startup, skills_cmd).await?;
+        }
+        Commands::AnthropicApi { port, host } => {
+            handle_anthropic_api_command(core_cfg.clone(), port, host).await?;
+        }
+        Commands::Update {
+            check,
+            force,
+            list,
+            limit,
+            pin,
+            unpin,
+            channel,
+            show_config,
+        } => {
+            let options = update::UpdateCommandOptions {
+                check_only: check,
+                force,
+                list,
+                limit,
+                pin,
+                unpin,
+                channel,
+                show_config,
+            };
+            update::handle_update_command(options).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn dispatch_schema_command(
+    command: vtcode_core::cli::args::SchemaCommands,
+    config: &vtcode_core::config::VTCodeConfig,
+) -> Result<String> {
+    schema::handle_schema_command(command, config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch_schema_command;
+    use crate::startup::StartupContext;
+    use clap::Parser;
+    use tempfile::TempDir;
+    use vtcode_commons::env_lock;
+    use vtcode_core::cli::args::{Cli, Commands};
+    use vtcode_core::config::ToolProfile;
+
+    #[tokio::test]
+    async fn schema_dispatch_receives_generic_profile_override_from_startup() {
+        let env_guard = env_lock::lock();
+        let temp = TempDir::new().expect("temp dir");
+        env_guard.set_var("OPENAI_API_KEY", "test");
+        // The default provider resolved from the built-in config is OpenRouter,
+        // so the startup context needs its key to initialize even though this
+        // test only exercises the offline schema dispatch path.
+        env_guard.set_var("OPENROUTER_API_KEY", "test");
+        let args = Cli::parse_from([
+            "vtcode",
+            "--workspace",
+            temp.path().to_str().expect("workspace path"),
+            "-c",
+            "tools.profile=advanced_vtcode",
+            "schema",
+            "tools",
+            "--format",
+            "ndjson",
+            "--name",
+            vtcode_core::config::constants::tools::CODE_SEARCH,
+        ]);
+        let startup = StartupContext::from_cli_args(&args).await.expect("startup context");
+        let command = args.command.clone().expect("schema command");
+
+        assert_eq!(startup.config.tools.profile, ToolProfile::AdvancedVtCode);
+        let Commands::Schema { command } = command else {
+            panic!("expected schema command");
+        };
+        let output = dispatch_schema_command(command, &startup.config)
+            .await
+            .expect("schema dispatch");
+
+        assert!(output.contains("\"name\":\"code_search\""), "{output}");
+    }
+}

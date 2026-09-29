@@ -1,0 +1,196 @@
+use anyhow::Result;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Instant;
+use tokio::sync::Notify;
+
+use vtcode_core::config::loader::VTCodeConfig;
+use vtcode_core::config::types::AgentConfig;
+use vtcode_core::core::agent::runtime::RuntimeSteering;
+use vtcode_core::llm::provider as uni;
+use vtcode_core::primary_agent::ActivePrimaryAgentState;
+use vtcode_core::utils::ansi::AnsiRenderer;
+use vtcode_ui::tui::app::InlineHandle;
+
+use crate::agent::runloop::ResumeSession;
+use crate::agent::runloop::model_picker::ModelPickerState;
+use crate::updater::StartupUpdateNotice;
+use vtcode_core::hooks::{LifecycleHookEngine, SessionEndReason};
+
+use crate::agent::runloop::unified::async_mcp_manager::AsyncMcpManager;
+use crate::agent::runloop::unified::inline_events::QueuedInput;
+use crate::agent::runloop::unified::palettes::ActivePalette;
+use crate::agent::runloop::unified::planning_workflow_state::PlanningWorkflowSessionState;
+use crate::agent::runloop::unified::session_setup::IdeContextBridge;
+use crate::agent::runloop::unified::state::{CtrlCState, SessionStats};
+use crate::agent::runloop::unified::tool_catalog::ToolCatalogState;
+use crate::agent::runloop::welcome::SessionBootstrap;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+pub(crate) struct InteractionLoopContext<'a> {
+    pub thread_id: &'a str,
+    pub active_thread_label: &'a str,
+    pub thread_handle: &'a vtcode_core::core::threads::ThreadRuntimeHandle,
+    pub renderer: &'a mut AnsiRenderer,
+    pub session: &'a mut vtcode_ui::tui::app::InlineSession,
+    pub handle: &'a InlineHandle,
+    pub header_context: &'a mut vtcode_ui::tui::app::InlineHeaderContext,
+    pub ide_context_bridge: &'a mut Option<IdeContextBridge>,
+    pub ctrl_c_state: &'a Arc<CtrlCState>,
+    pub ctrl_c_notify: &'a Arc<Notify>,
+    pub input_activity_counter: &'a Arc<AtomicU64>,
+    pub config: &'a mut AgentConfig,
+    pub vt_cfg: &'a mut Option<VTCodeConfig>,
+    pub provider_client: &'a mut Box<dyn uni::LLMProvider>,
+    pub session_bootstrap: &'a SessionBootstrap,
+    pub async_mcp_manager: &'a Option<Arc<AsyncMcpManager>>,
+    pub tool_registry: &'a mut vtcode_core::tools::registry::ToolRegistry,
+    pub tools: &'a Arc<tokio::sync::RwLock<Vec<uni::ToolDefinition>>>,
+    pub tool_catalog: &'a Arc<ToolCatalogState>,
+    pub conversation_history: &'a mut Vec<uni::Message>,
+    pub agent_touched_paths: &'a mut BTreeSet<PathBuf>,
+    pub decision_ledger: &'a Arc<tokio::sync::RwLock<vtcode_core::core::decision_tracker::DecisionTracker>>,
+    pub context_manager: &'a mut crate::agent::runloop::unified::context_manager::ContextManager,
+    pub active_primary_agent: &'a mut ActivePrimaryAgentState,
+    pub session_stats: &'a mut SessionStats,
+    pub plan_session: &'a mut PlanningWorkflowSessionState,
+    pub mcp_panel_state: &'a mut crate::agent::runloop::mcp_events::McpPanelState,
+    pub linked_directories: &'a mut Vec<crate::agent::runloop::unified::workspace_links::LinkedDirectory>,
+    pub lifecycle_hooks: &'a mut Option<LifecycleHookEngine>,
+    pub full_auto: bool,
+    pub skip_confirmations: bool,
+    pub approval_recorder: &'a Arc<vtcode_core::tools::ApprovalRecorder>,
+    pub tool_permission_cache: &'a Arc<tokio::sync::RwLock<vtcode_core::acp::ToolPermissionCache>>,
+    pub permissions_state: &'a Arc<tokio::sync::RwLock<vtcode_core::config::PermissionsConfig>>,
+    pub loaded_skills: &'a Arc<tokio::sync::RwLock<hashbrown::HashMap<String, vtcode_core::skills::Skill>>>,
+    pub default_placeholder: &'a mut Option<String>,
+    pub follow_up_placeholder: &'a mut Option<String>,
+    pub checkpoint_manager: Option<&'a vtcode_core::core::agent::snapshots::SnapshotManager>,
+    pub tool_result_cache: &'a Arc<tokio::sync::RwLock<vtcode_core::tools::ToolResultCache>>,
+    pub traj: &'a vtcode_core::core::trajectory::TrajectoryLogger,
+    pub harness_emitter: Option<&'a crate::agent::runloop::unified::inline_events::harness::HarnessEventEmitter>,
+    pub safety_validator: &'a Arc<crate::agent::runloop::unified::tool_call_safety::ToolCallSafetyValidator>,
+    pub circuit_breaker: &'a Arc<vtcode_core::tools::circuit_breaker::CircuitBreaker>,
+    pub tool_health_tracker: &'a Arc<vtcode_core::tools::health::ToolHealthTracker>,
+    pub rate_limiter: &'a Arc<vtcode_core::tools::adaptive_rate_limiter::AdaptiveRateLimiter>,
+    pub telemetry: &'a Arc<vtcode_core::core::telemetry::TelemetryManager>,
+    pub autonomous_executor: &'a Arc<vtcode_core::tools::autonomous_executor::AutonomousExecutor>,
+    pub error_recovery: &'a Arc<tokio::sync::RwLock<vtcode_core::core::agent::error_recovery::ErrorRecoveryState>>,
+    pub last_forced_redraw: &'a mut Instant,
+    pub turn_metadata_cache: &'a mut Option<Option<serde_json::Value>>,
+    pub harness_config: vtcode_config::core::agent::AgentHarnessConfig,
+    pub runtime_steering: &'a mut RuntimeSteering,
+    pub startup_update_notice_rx: &'a mut Option<tokio::sync::mpsc::UnboundedReceiver<StartupUpdateNotice>>,
+}
+
+impl<'a> InteractionLoopContext<'a> {
+    pub fn as_turn_processing_context<'b>(
+        &'b mut self,
+        harness_state: &'b mut crate::agent::runloop::unified::run_loop_context::HarnessTurnState,
+        auto_finish_planning_attempted: &'b mut bool,
+        input_status_state: &'b mut crate::agent::runloop::unified::status_line::InputStatusState,
+        direct_skip_confirmations: bool,
+    ) -> crate::agent::runloop::unified::turn::context::TurnProcessingContext<'b> {
+        let tool = crate::agent::runloop::unified::turn::context::ToolContext {
+            tool_result_cache: self.tool_result_cache,
+            approval_recorder: self.approval_recorder,
+            tool_registry: self.tool_registry,
+            tools: self.tools,
+            tool_catalog: self.tool_catalog,
+            tool_permission_cache: self.tool_permission_cache,
+            permissions_state: self.permissions_state,
+            safety_validator: self.safety_validator,
+            circuit_breaker: self.circuit_breaker,
+            tool_health_tracker: self.tool_health_tracker,
+            rate_limiter: self.rate_limiter,
+            telemetry: self.telemetry,
+            autonomous_executor: self.autonomous_executor,
+            error_recovery: self.error_recovery,
+        };
+        let llm = crate::agent::runloop::unified::turn::context::LLMContext {
+            provider_client: self.provider_client,
+            config: self.config,
+            vt_cfg: self.vt_cfg.as_ref(),
+            context_manager: self.context_manager,
+            active_primary_agent: &*self.active_primary_agent,
+            decision_ledger: self.decision_ledger,
+            traj: self.traj,
+        };
+        let ui = crate::agent::runloop::unified::turn::context::UIContext {
+            renderer: self.renderer,
+            handle: self.handle,
+            session: self.session,
+            active_thread_label: self.active_thread_label,
+            ctrl_c_state: self.ctrl_c_state,
+            ctrl_c_notify: self.ctrl_c_notify,
+            lifecycle_hooks: self.lifecycle_hooks.as_ref(),
+            default_placeholder: self.default_placeholder,
+            last_forced_redraw: self.last_forced_redraw,
+            input_status_state,
+        };
+        let state = crate::agent::runloop::unified::turn::context::TurnProcessingState {
+            session_stats: self.session_stats,
+            plan_session: self.plan_session,
+            auto_finish_planning_attempted,
+            mcp_panel_state: self.mcp_panel_state,
+            working_history: self.conversation_history,
+            turn_metadata_cache: self.turn_metadata_cache,
+            skip_confirmations: self.skip_confirmations || direct_skip_confirmations,
+            full_auto: self.full_auto,
+            harness_state,
+            harness_emitter: self.harness_emitter,
+            runtime_steering: self.runtime_steering,
+        };
+
+        crate::agent::runloop::unified::turn::context::TurnProcessingContext::from_parts(
+            crate::agent::runloop::unified::turn::context::TurnProcessingContextParts { tool, llm, ui, state },
+        )
+    }
+}
+
+pub(crate) struct InteractionState<'a> {
+    pub input_status_state: &'a mut crate::agent::runloop::unified::status_line::InputStatusState,
+    pub dismissed_memory_cleanup_fingerprint: &'a mut Option<(usize, usize)>,
+    pub queued_inputs: &'a mut VecDeque<QueuedInput>,
+    pub prefer_latest_queued_input_once: &'a mut bool,
+    pub model_picker_state: &'a mut Option<ModelPickerState>,
+    pub palette_state: &'a mut Option<ActivePalette>,
+    pub last_known_mcp_tools: &'a mut Vec<String>,
+    pub pending_mcp_refresh: &'a mut bool,
+    pub mcp_catalog_initialized: &'a mut bool,
+    pub last_mcp_refresh: &'a mut Instant,
+    pub ctrl_c_notice_displayed: &'a mut bool,
+    pub inline_prompt_cost_notice_shown: &'a mut bool,
+}
+
+pub(crate) enum InteractionOutcome {
+    Continue {
+        input: String,
+        prompt_message_index: Option<usize>,
+        turn_id: String,
+    },
+    /// A direct tool command (e.g. `!cmd` / `run ...`) was executed and rendered;
+    /// no LLM turn should be started for this loop iteration.
+    DirectToolHandled,
+    Exit {
+        reason: SessionEndReason,
+    },
+    Resume {
+        resume_session: Box<ResumeSession>,
+    },
+    /// Plan approved by user (Claude Code style HITL) - continue with implementation
+    PlanApproved {
+        /// If true, auto-accept file edits without prompting
+        auto_accept: bool,
+    },
+}
+
+pub(crate) fn run_interaction_loop<'a>(
+    ctx: &'a mut InteractionLoopContext<'_>,
+    state: &'a mut InteractionState<'_>,
+) -> impl Future<Output = Result<InteractionOutcome>> + 'a {
+    super::interaction_loop_runner::run_interaction_loop_impl(ctx, state)
+}

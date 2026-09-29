@@ -1,0 +1,16 @@
+id: no-debugger
+valid:
+  - |
+      const x = 1;
+  - |
+      function debug() {
+        return "debugger";
+      }
+invalid:
+  - |
+      debugger;
+  - |
+      function test() {
+        debugger;
+        return true;
+      }

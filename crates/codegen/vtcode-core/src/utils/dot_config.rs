@@ -1,0 +1,669 @@
+//! Dot folder configuration and cache management
+
+pub use crate::config::WorkspaceTrustLevel;
+use crate::config::constants::defaults;
+use crate::config::defaults::get_config_dir;
+use crate::utils::path::canonicalize_workspace;
+use hashbrown::HashMap;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use tokio::fs;
+
+/// VT Code configuration stored in ~/.vtcode/.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DotConfig {
+    /// Configuration schema version.
+    pub version: String,
+    /// Unix timestamp of the last update.
+    pub last_updated: u64,
+    /// User preference settings.
+    pub preferences: UserPreferences,
+    /// LLM provider configurations.
+    pub providers: ProviderConfigs,
+    /// Cache settings.
+    pub cache: CacheConfig,
+    /// UI configuration.
+    pub ui: UiConfig,
+    /// Workspace trust records.
+    #[serde(default)]
+    pub workspace_trust: WorkspaceTrustStore,
+    /// Dependency notice display state.
+    #[serde(default)]
+    pub dependency_notices: DependencyNoticeStore,
+}
+
+/// User preference settings for the application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPreferences {
+    /// Default LLM model identifier.
+    pub default_model: String,
+    /// Default LLM provider name.
+    pub default_provider: String,
+    /// Maximum tokens for generation.
+    pub max_tokens: Option<u32>,
+    /// Sampling temperature.
+    pub temperature: Option<f32>,
+    /// Whether to auto-save on changes.
+    pub auto_save: bool,
+    /// UI theme name.
+    pub theme: String,
+    /// Custom keybinding mappings.
+    pub keybindings: HashMap<String, String>,
+}
+
+/// Configuration for all supported LLM providers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderConfigs {
+    /// OpenAI provider configuration.
+    pub openai: Option<ProviderConfig>,
+    /// Anthropic provider configuration.
+    pub anthropic: Option<ProviderConfig>,
+    /// Google Gemini provider configuration.
+    pub gemini: Option<ProviderConfig>,
+    /// DeepSeek provider configuration.
+    pub deepseek: Option<ProviderConfig>,
+    /// OpenRouter provider configuration.
+    pub openrouter: Option<ProviderConfig>,
+    /// Ollama provider configuration.
+    pub ollama: Option<ProviderConfig>,
+    /// LM Studio provider configuration.
+    pub lmstudio: Option<ProviderConfig>,
+    /// llama.cpp provider configuration.
+    pub llamacpp: Option<ProviderConfig>,
+    /// MiniMax provider configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimax: Option<ProviderConfig>,
+    /// StepFun provider configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stepfun: Option<ProviderConfig>,
+    /// Evolink provider configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evolink: Option<ProviderConfig>,
+}
+
+/// Store of workspace trust records.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkspaceTrustStore {
+    /// Map of workspace paths to their trust records.
+    #[serde(default)]
+    pub entries: HashMap<String, WorkspaceTrustRecord>,
+}
+
+/// Record of a workspace's trust level and when it was granted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceTrustRecord {
+    /// Trust level assigned to the workspace.
+    pub level: WorkspaceTrustLevel,
+    /// Unix timestamp when trust was granted.
+    pub trusted_at: u64,
+}
+
+/// Store tracking which dependency notices have been shown.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DependencyNoticeStore {
+    /// Whether the ripgrep missing notice has been shown.
+    #[serde(default)]
+    pub ripgrep_missing_notice_shown: bool,
+    /// Whether the ast-grep missing notice has been shown.
+    #[serde(default)]
+    pub ast_grep_missing_notice_shown: bool,
+}
+
+/// Configuration for an individual LLM provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderConfig {
+    /// API key for authentication.
+    pub api_key: Option<String>,
+    /// Custom base URL for the API endpoint.
+    pub base_url: Option<String>,
+    /// Default model for this provider.
+    pub model: Option<String>,
+    /// Whether this provider is enabled.
+    pub enabled: bool,
+    /// Priority for provider selection (higher = preferred).
+    pub priority: i32,
+}
+
+/// Cache configuration settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Whether caching is enabled.
+    pub enabled: bool,
+    /// Maximum cache size in megabytes.
+    pub max_size_mb: u64,
+    /// Time-to-live for cached entries in days.
+    pub ttl_days: u64,
+    /// Whether prompt caching is enabled.
+    pub prompt_cache_enabled: bool,
+    /// Whether context caching is enabled.
+    pub context_cache_enabled: bool,
+}
+
+/// UI configuration settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// Whether to show timestamps in output.
+    pub show_timestamps: bool,
+    /// Maximum number of output lines to display.
+    pub max_output_lines: usize,
+    /// Whether syntax highlighting is enabled.
+    pub syntax_highlighting: bool,
+    /// Whether auto-completion is enabled.
+    pub auto_complete: bool,
+    /// Number of history entries to retain.
+    pub history_size: usize,
+}
+
+impl Default for DotConfig {
+    fn default() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").into(),
+            last_updated: unix_timestamp_secs().unwrap_or(0),
+            preferences: UserPreferences::default(),
+            providers: ProviderConfigs::default(),
+            cache: CacheConfig::default(),
+            ui: UiConfig::default(),
+            workspace_trust: WorkspaceTrustStore::default(),
+            dependency_notices: DependencyNoticeStore::default(),
+        }
+    }
+}
+
+impl Default for UserPreferences {
+    fn default() -> Self {
+        Self {
+            default_model: defaults::DEFAULT_MODEL.into(),
+            default_provider: defaults::DEFAULT_PROVIDER.into(),
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            auto_save: true,
+            theme: defaults::DEFAULT_THEME.into(),
+            keybindings: HashMap::new(),
+        }
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size_mb: 100,
+            ttl_days: 30,
+            prompt_cache_enabled: true,
+            context_cache_enabled: true,
+        }
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            show_timestamps: true,
+            max_output_lines: 1000,
+            syntax_highlighting: true,
+            auto_complete: true,
+            history_size: 1000,
+        }
+    }
+}
+
+/// Dot folder manager for VT Code configuration and cache.
+#[derive(Clone)]
+pub struct DotManager {
+    config_dir: PathBuf,
+    cache_dir: PathBuf,
+    config_file: PathBuf,
+}
+
+impl DotManager {
+    /// Creates a new `DotManager` using the default configuration directory.
+    pub fn new() -> Result<Self, DotError> {
+        let config_dir = get_config_dir().ok_or(DotError::HomeDirNotFound)?;
+        let cache_dir = config_dir.join("cache");
+        let config_file = config_dir.join("config.toml");
+
+        Ok(Self { config_dir, cache_dir, config_file })
+    }
+
+    /// Initialize the dot folder structure
+    pub async fn initialize(&self) -> Result<(), DotError> {
+        // Create directories
+        fs::create_dir_all(&self.config_dir).await.map_err(DotError::Io)?;
+        fs::create_dir_all(&self.cache_dir).await.map_err(DotError::Io)?;
+
+        // Create subdirectories
+        let subdirs = [
+            "cache/prompts",
+            "cache/context",
+            "cache/models",
+            "logs",
+            "sessions",
+            "backups",
+        ];
+
+        for subdir in &subdirs {
+            fs::create_dir_all(self.config_dir.join(subdir)).await.map_err(DotError::Io)?;
+        }
+
+        // Create default config if it doesn't exist
+        if !fs::try_exists(&self.config_file).await.unwrap_or(false) {
+            let default_config = DotConfig::default();
+            self.save_config(&default_config).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Load configuration from disk
+    pub async fn load_config(&self) -> Result<DotConfig, DotError> {
+        if !fs::try_exists(&self.config_file).await.unwrap_or(false) {
+            return Ok(DotConfig::default());
+        }
+
+        let content = fs::read_to_string(&self.config_file).await.map_err(DotError::Io)?;
+
+        toml::from_str(&content).map_err(DotError::TomlDe)
+    }
+
+    /// Save configuration to disk
+    pub async fn save_config(&self, config: &DotConfig) -> Result<(), DotError> {
+        let content = toml::to_string_pretty(config).map_err(DotError::Toml)?;
+
+        fs::write(&self.config_file, content).await.map_err(DotError::Io)?;
+
+        Ok(())
+    }
+
+    /// Update configuration with new values
+    pub async fn update_config<F>(&self, updater: F) -> Result<(), DotError>
+    where
+        F: FnOnce(&mut DotConfig),
+    {
+        let mut config = self.load_config().await?;
+        updater(&mut config);
+        config.last_updated = unix_timestamp_secs()?;
+        self.save_config(&config).await
+    }
+
+    /// Load the trust level recorded for a workspace, if any.
+    pub async fn workspace_trust_level(&self, workspace: &Path) -> Result<Option<WorkspaceTrustLevel>, DotError> {
+        let workspace_key = workspace_trust_key(workspace);
+        let config = self.load_config().await?;
+
+        Ok(config.workspace_trust.entries.get(&workspace_key).map(|record| record.level))
+    }
+
+    /// Persist a workspace trust level in the dot configuration.
+    pub async fn update_workspace_trust(&self, workspace: &Path, level: WorkspaceTrustLevel) -> Result<(), DotError> {
+        let workspace_key = workspace_trust_key(workspace);
+        let trusted_at = unix_timestamp_secs()?;
+
+        self.update_config(|cfg| {
+            cfg.workspace_trust
+                .entries
+                .insert(workspace_key, WorkspaceTrustRecord { level, trusted_at });
+        })
+        .await
+    }
+
+    /// Get cache directory for a specific type
+    pub fn cache_dir(&self, cache_type: &str) -> PathBuf {
+        self.cache_dir.join(cache_type)
+    }
+
+    /// Get logs directory
+    pub fn logs_dir(&self) -> PathBuf {
+        self.config_dir.join("logs")
+    }
+
+    /// Get sessions directory
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.config_dir.join("sessions")
+    }
+
+    /// Get backups directory
+    pub fn backups_dir(&self) -> PathBuf {
+        self.config_dir.join("backups")
+    }
+
+    /// Clean up old cache files
+    pub async fn cleanup_cache(&self) -> Result<CacheCleanupStats, DotError> {
+        let config = self.load_config().await?;
+        let max_age = std::time::Duration::from_secs(config.cache.ttl_days * 24 * 60 * 60);
+        let now = std::time::SystemTime::now();
+
+        let mut stats = CacheCleanupStats::default();
+
+        // Clean prompt cache
+        if config.cache.prompt_cache_enabled {
+            stats.prompts_cleaned = self.cleanup_directory(&self.cache_dir("prompts"), max_age, now).await?;
+        }
+
+        // Clean context cache
+        if config.cache.context_cache_enabled {
+            stats.context_cleaned = self.cleanup_directory(&self.cache_dir("context"), max_age, now).await?;
+        }
+
+        // Clean model cache
+        stats.models_cleaned = self.cleanup_directory(&self.cache_dir("models"), max_age, now).await?;
+
+        Ok(stats)
+    }
+
+    /// Clean up files in a directory older than max_age
+    async fn cleanup_directory(
+        &self,
+        dir: &Path,
+        max_age: std::time::Duration,
+        now: std::time::SystemTime,
+    ) -> Result<u64, DotError> {
+        if !fs::try_exists(dir).await.unwrap_or(false) {
+            return Ok(0);
+        }
+
+        let mut cleaned = 0u64;
+        let mut entries = fs::read_dir(dir).await.map_err(DotError::Io)?;
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+
+            if let Ok(metadata) = entry.metadata().await
+                && let Ok(modified) = metadata.modified()
+                && let Ok(age) = now.duration_since(modified)
+                && age > max_age
+            {
+                if path.is_file() {
+                    fs::remove_file(&path).await.map_err(DotError::Io)?;
+                    cleaned += 1;
+                } else if path.is_dir() {
+                    fs::remove_dir_all(&path).await.map_err(DotError::Io)?;
+                    cleaned += 1;
+                }
+            }
+        }
+
+        Ok(cleaned)
+    }
+
+    /// Get disk usage statistics
+    pub async fn disk_usage(&self) -> Result<DiskUsageStats, DotError> {
+        let mut stats = DiskUsageStats::default();
+
+        stats.config_size = self.calculate_dir_size(&self.config_dir).await?;
+        stats.cache_size = self.calculate_dir_size(&self.cache_dir).await?;
+        stats.logs_size = self.calculate_dir_size(&self.logs_dir()).await?;
+        stats.sessions_size = self.calculate_dir_size(&self.sessions_dir()).await?;
+        stats.backups_size = self.calculate_dir_size(&self.backups_dir()).await?;
+
+        stats.total_size =
+            stats.config_size + stats.cache_size + stats.logs_size + stats.sessions_size + stats.backups_size;
+
+        Ok(stats)
+    }
+
+    /// Calculate directory size recursively
+    async fn calculate_dir_size(&self, dir: &Path) -> Result<u64, DotError> {
+        if !fs::try_exists(dir).await.unwrap_or(false) {
+            return Ok(0);
+        }
+
+        let mut size = 0u64;
+
+        fn calculate_recursive<'a>(
+            path: &'a Path,
+            current_size: &'a mut u64,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), DotError>> + Send + 'a>> {
+            Box::pin(async move {
+                let metadata = fs::metadata(path).await.map_err(DotError::Io)?;
+                if metadata.is_file() {
+                    *current_size += metadata.len();
+                } else if metadata.is_dir() {
+                    let mut entries = fs::read_dir(path).await.map_err(DotError::Io)?;
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        calculate_recursive(&entry.path(), current_size).await?;
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        calculate_recursive(dir, &mut size).await?;
+        Ok(size)
+    }
+
+    /// Backup current configuration
+    pub async fn backup_config(&self) -> Result<PathBuf, DotError> {
+        let timestamp = unix_timestamp_secs()?;
+
+        let backup_name = format!("config_backup_{timestamp}.toml");
+        let backup_path = self.backups_dir().join(backup_name);
+
+        if fs::try_exists(&self.config_file).await.unwrap_or(false) {
+            fs::copy(&self.config_file, &backup_path).await.map_err(DotError::Io)?;
+        }
+
+        Ok(backup_path)
+    }
+
+    /// List available backups
+    pub async fn list_backups(&self) -> Result<Vec<PathBuf>, DotError> {
+        let backups_dir = self.backups_dir();
+        if !fs::try_exists(&backups_dir).await.unwrap_or(false) {
+            return Ok(vec![]);
+        }
+
+        let mut backups = vec![];
+        let mut entries = fs::read_dir(backups_dir).await.map_err(DotError::Io)?;
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("toml") {
+                backups.push(entry.path());
+            }
+        }
+
+        // Sort by modification time (newest first)
+        // Note: We need to collect metadata asynchronously
+        let mut backup_times = Vec::new();
+        for backup in &backups {
+            let time = fs::metadata(backup).await.ok().and_then(|m| m.modified().ok());
+            backup_times.push((backup.clone(), time));
+        }
+        backup_times.sort_by(|a, b| b.1.cmp(&a.1));
+
+        Ok(backup_times.into_iter().map(|(path, _)| path).collect())
+    }
+
+    /// Restore configuration from backup
+    pub async fn restore_backup(&self, backup_path: &Path) -> Result<(), DotError> {
+        if !fs::try_exists(backup_path).await.unwrap_or(false) {
+            return Err(DotError::BackupNotFound(backup_path.to_path_buf()));
+        }
+
+        fs::copy(backup_path, &self.config_file).await.map_err(DotError::Io)?;
+
+        Ok(())
+    }
+}
+
+/// Statistics from a cache cleanup operation.
+#[derive(Debug, Default)]
+pub struct CacheCleanupStats {
+    /// Number of prompt cache entries cleaned.
+    pub prompts_cleaned: u64,
+    /// Number of context cache entries cleaned.
+    pub context_cleaned: u64,
+    /// Number of model cache entries cleaned.
+    pub models_cleaned: u64,
+}
+
+/// Disk usage statistics for the dot folder.
+#[derive(Debug, Default)]
+pub struct DiskUsageStats {
+    /// Size of the configuration directory in bytes.
+    pub config_size: u64,
+    /// Size of the cache directory in bytes.
+    pub cache_size: u64,
+    /// Size of the logs directory in bytes.
+    pub logs_size: u64,
+    /// Size of the sessions directory in bytes.
+    pub sessions_size: u64,
+    /// Size of the backups directory in bytes.
+    pub backups_size: u64,
+    /// Total size across all directories in bytes.
+    pub total_size: u64,
+}
+
+/// Errors that can occur during dot folder operations.
+#[derive(Debug, thiserror::Error)]
+pub enum DotError {
+    /// The user's home directory could not be determined.
+    #[error("Home directory not found")]
+    HomeDirNotFound,
+
+    /// A system time error occurred.
+    #[error("System time error: {0}")]
+    SystemTime(#[from] std::time::SystemTimeError),
+
+    /// An I/O error occurred.
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// TOML serialization failed.
+    #[error("TOML serialization error: {0}")]
+    Toml(#[from] toml::ser::Error),
+
+    /// TOML deserialization failed.
+    #[error("TOML deserialization error: {0}")]
+    TomlDe(#[from] toml::de::Error),
+
+    /// The specified backup file was not found.
+    #[error("Backup not found: {0}")]
+    BackupNotFound(PathBuf),
+
+    /// The dot manager mutex was poisoned.
+    #[error("Dot manager lock poisoned: {0}")]
+    LockPoisoned(String),
+}
+
+fn unix_timestamp_secs() -> Result<u64, DotError> {
+    Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
+}
+
+fn workspace_trust_key(workspace: &Path) -> String {
+    canonicalize_workspace(workspace).to_string_lossy().into_owned()
+}
+
+/// Global dot manager instance
+static DOT_MANAGER: OnceLock<Mutex<DotManager>> = OnceLock::new();
+
+/// Get global dot manager instance
+pub fn get_dot_manager() -> Result<&'static Mutex<DotManager>, DotError> {
+    if let Some(manager) = DOT_MANAGER.get() {
+        return Ok(manager);
+    }
+
+    let manager = DotManager::new()?;
+    Ok(DOT_MANAGER.get_or_init(|| Mutex::new(manager)))
+}
+
+fn clone_manager() -> Result<DotManager, DotError> {
+    let manager = get_dot_manager()?;
+    let guard = manager.lock().map_err(|err| DotError::LockPoisoned(err.to_string()))?;
+    Ok(guard.clone())
+}
+
+/// Initialize dot folder (should be called at startup)
+pub async fn initialize_dot_folder() -> Result<(), DotError> {
+    let manager = clone_manager()?;
+    manager.initialize().await
+}
+
+/// Load user configuration
+pub async fn load_user_config() -> Result<DotConfig, DotError> {
+    let manager = clone_manager()?;
+    manager.load_config().await
+}
+
+/// Save user configuration
+pub async fn save_user_config(config: &DotConfig) -> Result<(), DotError> {
+    let manager = clone_manager()?;
+    manager.save_config(config).await
+}
+
+/// Load the trust level recorded for a workspace, if any.
+pub async fn load_workspace_trust_level(workspace: &Path) -> Result<Option<WorkspaceTrustLevel>, DotError> {
+    let manager = clone_manager()?;
+    manager.workspace_trust_level(workspace).await
+}
+
+/// Persist the trust level recorded for a workspace.
+pub async fn update_workspace_trust(workspace: &Path, level: WorkspaceTrustLevel) -> Result<(), DotError> {
+    let manager = clone_manager()?;
+    manager.update_workspace_trust(workspace, level).await
+}
+
+/// Persist the preferred UI theme in the user's dot configuration.
+pub async fn update_theme_preference(theme: &str) -> Result<(), DotError> {
+    let manager = clone_manager()?;
+    manager.update_config(|cfg| cfg.preferences.theme = theme.to_string()).await
+}
+
+/// Persist the preferred provider and model combination.
+pub async fn update_model_preference(provider: &str, model: &str) -> Result<(), DotError> {
+    let manager = clone_manager()?;
+    manager
+        .update_config(|cfg| {
+            cfg.preferences.default_provider = provider.to_string();
+            cfg.preferences.default_model = model.to_string();
+        })
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_dot_manager_initialization() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".vtcode");
+
+        // Test directory creation
+        assert!(!config_dir.exists());
+
+        let manager = DotManager {
+            config_dir: config_dir.clone(),
+            cache_dir: config_dir.join("cache"),
+            config_file: config_dir.join("config.toml"),
+        };
+
+        manager.initialize().await.unwrap();
+        assert!(config_dir.exists());
+        assert!(config_dir.join("cache").exists());
+        assert!(config_dir.join("logs").exists());
+    }
+
+    #[tokio::test]
+    async fn test_config_save_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join(".vtcode");
+
+        let manager = DotManager {
+            config_dir: config_dir.clone(),
+            cache_dir: config_dir.join("cache"),
+            config_file: config_dir.join("config.toml"),
+        };
+
+        manager.initialize().await.unwrap();
+
+        let mut config = DotConfig::default();
+        config.preferences.default_model = "test-model".to_owned();
+
+        manager.save_config(&config).await.unwrap();
+        let loaded_config = manager.load_config().await.unwrap();
+
+        assert_eq!(loaded_config.preferences.default_model, "test-model");
+    }
+}

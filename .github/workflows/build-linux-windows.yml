@@ -1,0 +1,257 @@
+name: Build Linux and Windows Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g., 0.81.2)"
+        required: true
+        type: string
+      build_windows:
+        description: "Also build Windows x86_64 binary"
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build (e.g., 0.81.2)"
+        required: true
+        type: string
+      build_windows:
+        description: "Also build Windows x86_64 binary"
+        required: false
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.tag }}
+  cancel-in-progress: true
+
+# This repo is public, so standard ubuntu-latest and windows-latest runners
+# are free and do not consume any account quota. See:
+# https://docs.github.com/billing/managing-billing-for-github-actions/about-billing-for-github-actions
+# - Linux builds run on ubuntu-latest using Cross
+# - Windows build is on by default and can be disabled per-run via input
+# - Minimal artifact retention (7 days)
+# - Efficient caching
+
+jobs:
+  build-linux:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Wait for tag to exist
+        shell: bash
+        run: |
+          for i in $(seq 1 12); do
+            if git ls-remote --exit-code --tags "https://github.com/vinhnx/VTCode.git" "${{ inputs.tag }}"; then
+              echo "Tag ${{ inputs.tag }} found"
+              exit 0
+            fi
+            echo "Tag ${{ inputs.tag }} not found yet, waiting 10s..."
+            sleep 10
+          done
+          echo "::error::Tag ${{ inputs.tag }} does not exist after 120s" >&2
+          exit 1
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # All matrix targets run on ubuntu-latest and pass --target via the CLI,
+      # so rust-cache otherwise computes one shared cache key for every job. The
+      # parallel saves then collide ("another job may be creating this cache"),
+      # each save fails, and every target ends up restoring a partial/mismatched
+      # cache (full match: false) and recompiles its whole dependency tree.
+      # Namespace per target so each job owns its own cache entry and saves win.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Zig
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+
+      - name: Install Cross
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        uses: taiki-e/install-action@fae525311e5e299134b606bf247d465dd0df8190 # v2
+        with:
+          tool: cross
+
+      - name: Build with cargo (${{ matrix.target }})
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --profile release-fast --target ${{ matrix.target }} --features allocator-jemalloc --jobs 4
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64') && '-C target-cpu=x86-64' || '' }}
+
+      - name: Build with cross (${{ matrix.target }})
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: cross build --profile release-fast --target ${{ matrix.target }} ${{ endsWith(matrix.target, 'linux-gnu') && ' --features allocator-jemalloc' || '' }} --jobs 4
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64') && '-C target-cpu=x86-64' || '' }}
+
+      - name: Verify Linux TLS linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_absent() {
+            local package="$1"
+            local tree_output
+
+            set +e
+            tree_output="$(cargo tree -e normal -i "$package" --target "${{ matrix.target }}" 2>&1)"
+            local status=$?
+            set -e
+
+            if printf '%s\n' "$tree_output" | grep -Eq "^${package} v"; then
+              echo "✗ ${package} detected in Linux dependency graph" >&2
+              printf '%s\n' "$tree_output" >&2
+              exit 1
+            fi
+
+            if [ "$status" -ne 0 ] \
+              && ! printf '%s\n' "$tree_output" | grep -Eq "nothing to print\\.|did not match any packages"; then
+              echo "✗ Failed to inspect ${package} dependency graph" >&2
+              printf '%s\n' "$tree_output" >&2
+              exit "$status"
+            fi
+          }
+
+          check_absent native-tls
+          check_absent openssl-sys
+          echo "✓ Linux dependency graph is rustls-only (no native-tls/openssl-sys)"
+
+      - name: Check Binary
+        shell: bash
+        run: |
+          if [ -f "target/${{ matrix.target }}/release-fast/vtcode" ]; then
+            echo "✓ Found Unix binary: vtcode"
+          else
+            echo "✗ Binary not found!" && exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release-fast
+          tar -czf ../../../vtcode-${{ inputs.tag }}-${{ matrix.target }}.tar.gz vtcode
+          cd ../../../
+          if command -v sha256sum &> /dev/null; then
+            sha256sum vtcode-${{ inputs.tag }}-${{ matrix.target }}.tar.gz > vtcode-${{ inputs.tag }}-${{ matrix.target }}.sha256
+          elif command -v shasum &> /dev/null; then
+            shasum -a 256 vtcode-${{ inputs.tag }}-${{ matrix.target }}.tar.gz > vtcode-${{ inputs.tag }}-${{ matrix.target }}.sha256
+          fi
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vtcode-${{ inputs.tag }}-${{ matrix.target }}
+          path: |
+            vtcode-${{ inputs.tag }}-${{ matrix.target }}.tar.gz
+            vtcode-${{ inputs.tag }}-${{ matrix.target }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  build-windows:
+    if: ${{ inputs.build_windows == true || github.event.inputs.build_windows == 'true' }}
+    name: Build (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Wait for tag to exist
+        shell: bash
+        run: |
+          for i in $(seq 1 12); do
+            if git ls-remote --exit-code --tags "https://github.com/vinhnx/VTCode.git" "${{ inputs.tag }}"; then
+              echo "Tag ${{ inputs.tag }} found"
+              exit 0
+            fi
+            echo "Tag ${{ inputs.tag }} not found yet, waiting 10s..."
+            sleep 10
+          done
+          echo "::error::Tag ${{ inputs.tag }} does not exist after 120s" >&2
+          exit 1
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: Build (x86_64-pc-windows-msvc)
+        run: cargo build --profile release-fast --target x86_64-pc-windows-msvc --jobs 4
+        shell: bash
+
+      - name: Check Binary
+        shell: bash
+        run: |
+          if [ -f "target/x86_64-pc-windows-msvc/release-fast/vtcode.exe" ]; then
+            echo "✓ Found Windows binary: vtcode.exe"
+          else
+            echo "✗ Binary not found!" && exit 1
+          fi
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $archive = "vtcode-${{ inputs.tag }}-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release-fast/vtcode.exe" -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "vtcode-${{ inputs.tag }}-x86_64-pc-windows-msvc.sha256" -Value $hash -NoNewline
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vtcode-${{ inputs.tag }}-x86_64-pc-windows-msvc
+          path: |
+            vtcode-${{ inputs.tag }}-x86_64-pc-windows-msvc.zip
+            vtcode-${{ inputs.tag }}-x86_64-pc-windows-msvc.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

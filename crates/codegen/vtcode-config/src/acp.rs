@@ -1,0 +1,298 @@
+use crate::constants::env::acp::AgentClientProtocolEnvKey;
+use serde::{Deserialize, Serialize};
+
+fn parse_env_bool(key: AgentClientProtocolEnvKey, default: bool) -> bool {
+    crate::env_helpers::parse_env_bool(key.as_str(), default)
+}
+
+fn default_enabled() -> bool {
+    parse_env_bool(AgentClientProtocolEnvKey::Enabled, false)
+}
+
+fn default_zed_enabled() -> bool {
+    parse_env_bool(AgentClientProtocolEnvKey::ZedEnabled, default_enabled())
+}
+
+fn default_zed_tools_read_file_enabled() -> bool {
+    parse_env_bool(AgentClientProtocolEnvKey::ZedToolsReadFileEnabled, true)
+}
+
+fn default_zed_tools_list_files_enabled() -> bool {
+    parse_env_bool(AgentClientProtocolEnvKey::ZedToolsListFilesEnabled, true)
+}
+
+fn parse_env_trust_mode(
+    key: AgentClientProtocolEnvKey,
+    default: AgentClientProtocolZedWorkspaceTrustMode,
+) -> AgentClientProtocolZedWorkspaceTrustMode {
+    std::env::var(key.as_str())
+        .ok()
+        .and_then(|value| AgentClientProtocolZedWorkspaceTrustMode::from_env_value(&value))
+        .unwrap_or(default)
+}
+
+fn default_zed_workspace_trust_mode() -> AgentClientProtocolZedWorkspaceTrustMode {
+    parse_env_trust_mode(
+        AgentClientProtocolEnvKey::ZedWorkspaceTrust,
+        AgentClientProtocolZedWorkspaceTrustMode::FullAuto,
+    )
+}
+
+fn default_transport() -> AgentClientProtocolTransport {
+    AgentClientProtocolTransport::Stdio
+}
+
+/// Agent Client Protocol configuration root
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentClientProtocolConfig {
+    /// Globally enable the ACP bridge
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    /// Agent Client Protocol settings
+    #[serde(default)]
+    pub zed: AgentClientProtocolZedConfig,
+}
+
+impl Default for AgentClientProtocolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            zed: AgentClientProtocolZedConfig::default(),
+        }
+    }
+}
+
+/// Transport options supported by the ACP bridge
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentClientProtocolTransport {
+    /// Communicate over stdio (spawned process model)
+    Stdio,
+}
+
+impl Default for AgentClientProtocolTransport {
+    fn default() -> Self {
+        default_transport()
+    }
+}
+
+/// Zed-specific configuration
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentClientProtocolZedConfig {
+    /// Enable Zed integration
+    #[serde(default = "default_zed_enabled")]
+    pub enabled: bool,
+
+    /// Transport used to communicate with the Zed client
+    #[serde(default = "default_transport")]
+    pub transport: AgentClientProtocolTransport,
+
+    /// Tool toggles exposed through the Zed bridge
+    #[serde(default)]
+    pub tools: AgentClientProtocolZedToolsConfig,
+
+    /// Desired workspace trust level when running under ACP
+    #[serde(default = "default_zed_workspace_trust_mode")]
+    pub workspace_trust: AgentClientProtocolZedWorkspaceTrustMode,
+
+    /// Authentication method configuration for ACP
+    #[serde(default)]
+    pub auth: AcpAuthConfig,
+}
+
+impl Default for AgentClientProtocolZedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_zed_enabled(),
+            transport: default_transport(),
+            tools: AgentClientProtocolZedToolsConfig::default(),
+            workspace_trust: default_zed_workspace_trust_mode(),
+            auth: AcpAuthConfig::default(),
+        }
+    }
+}
+
+/// Zed bridge tool configuration flags
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentClientProtocolZedToolsConfig {
+    /// Toggle the read_file function bridge
+    #[serde(default = "default_zed_tools_read_file_enabled")]
+    pub read_file: bool,
+
+    /// Toggle the list_files function bridge
+    #[serde(default = "default_zed_tools_list_files_enabled")]
+    pub list_files: bool,
+}
+
+impl Default for AgentClientProtocolZedToolsConfig {
+    fn default() -> Self {
+        Self {
+            read_file: default_zed_tools_read_file_enabled(),
+            list_files: default_zed_tools_list_files_enabled(),
+        }
+    }
+}
+
+/// Workspace trust configuration for the Zed ACP bridge
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentClientProtocolZedWorkspaceTrustMode {
+    /// Maintain full automation trust
+    FullAuto,
+    /// Restrict to tools policy safeguards
+    ToolsPolicy,
+}
+
+impl AgentClientProtocolZedWorkspaceTrustMode {
+    fn from_env_value(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "full_auto" | "full-auto" | "full" => Some(Self::FullAuto),
+            "tools_policy" | "tools-policy" | "tools" => Some(Self::ToolsPolicy),
+            _ => None,
+        }
+    }
+
+    /// Resolve the workspace trust level represented by this configuration.
+    pub fn to_workspace_trust_level(self) -> WorkspaceTrustLevel {
+        match self {
+            Self::FullAuto => WorkspaceTrustLevel::FullAuto,
+            Self::ToolsPolicy => WorkspaceTrustLevel::ToolsPolicy,
+        }
+    }
+}
+
+/// Workspace trust levels exposed through the Agent Client Protocol configuration.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum WorkspaceTrustLevel {
+    #[default]
+    ToolsPolicy,
+    FullAuto,
+}
+
+impl std::fmt::Display for WorkspaceTrustLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkspaceTrustLevel::ToolsPolicy => write!(f, "tools policy"),
+            WorkspaceTrustLevel::FullAuto => write!(f, "full auto"),
+        }
+    }
+}
+
+/// ACP authentication method
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpAuthMethod {
+    /// Agent handles authentication itself (e.g., OAuth flows)
+    #[default]
+    Agent,
+    /// User provides an API key via an environment variable
+    EnvVar,
+    /// Interactive terminal-based login
+    Terminal,
+    /// Forward-compatible catch-all for unknown method values
+    #[serde(other)]
+    Unknown,
+}
+
+impl AcpAuthMethod {
+    /// Returns the string representation of this auth method.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Agent => "agent",
+            Self::EnvVar => "env_var",
+            Self::Terminal => "terminal",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for AcpAuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// ACP authentication configuration
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AcpAuthConfig {
+    /// Default authentication method for ACP agents
+    /// Options: "agent" (default - agent handles auth), "env_var", "terminal"
+    #[serde(default = "default_auth_method")]
+    pub default_method: AcpAuthMethod,
+
+    /// Environment variable name for auth (used when default_method is "env_var")
+    /// Examples: "OPENAI_API_KEY", "ANTHROPIC_API_KEY"
+    #[serde(default)]
+    pub env_var_name: Option<String>,
+
+    /// URL where users can get their API key (optional, for UI display)
+    #[serde(default)]
+    pub auth_url: Option<String>,
+}
+
+fn default_auth_method() -> AcpAuthMethod {
+    AcpAuthMethod::Agent
+}
+
+impl Default for AcpAuthConfig {
+    fn default() -> Self {
+        Self {
+            default_method: default_auth_method(),
+            env_var_name: None,
+            auth_url: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_use_stdio_transport() {
+        let cfg = AgentClientProtocolConfig::default();
+        assert!(matches!(cfg.zed.transport, AgentClientProtocolTransport::Stdio));
+        assert!(cfg.zed.tools.read_file);
+        assert!(cfg.zed.tools.list_files);
+        assert!(matches!(cfg.zed.workspace_trust, AgentClientProtocolZedWorkspaceTrustMode::FullAuto));
+    }
+
+    #[test]
+    fn test_acp_auth_config_defaults() {
+        let auth = AcpAuthConfig::default();
+        assert_eq!(auth.default_method, AcpAuthMethod::Agent);
+        assert!(auth.env_var_name.is_none());
+        assert!(auth.auth_url.is_none());
+    }
+
+    #[test]
+    fn test_acp_auth_config_in_zed_config() {
+        let cfg = AgentClientProtocolZedConfig::default();
+        assert_eq!(cfg.auth.default_method, AcpAuthMethod::Agent);
+    }
+
+    #[test]
+    fn test_acp_auth_config_deserialization() {
+        let toml_str = r#"
+default_method = "env_var"
+env_var_name = "OPENAI_API_KEY"
+auth_url = "https://platform.openai.com/api-keys"
+"#;
+        let auth: AcpAuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.default_method, AcpAuthMethod::EnvVar);
+        assert_eq!(auth.env_var_name, Some("OPENAI_API_KEY".to_string()));
+        assert_eq!(auth.auth_url, Some("https://platform.openai.com/api-keys".to_string()));
+    }
+}

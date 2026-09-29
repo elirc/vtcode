@@ -1,0 +1,389 @@
+name: "CI Pipeline"
+permissions: {}
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+  push:
+    branches:
+      - main
+    paths:
+      - "**.rs"
+      - "**.toml"
+      - "**.lock"
+      - "**.yml"
+      - "**.yaml"
+      - "**.json"
+      - "**.js"
+      - "**.ts"
+      - "**.md" # Still run on markdown changes since we have markdown linting
+      - "scripts/**"
+      - "!.github/dependabot.yml" # Exclude dependabot changes
+      - "!.gitignore"
+      - "!.vtcodegitignore"
+      - "!.env*"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**.rs"
+      - "**.toml"
+      - "**.lock"
+      - "**.yml"
+      - "**.yaml"
+      - "**.json"
+      - "**.js"
+      - "**.ts"
+      - "**.md" # Still run on markdown changes since we have markdown linting
+      - "scripts/**"
+      - "!.github/dependabot.yml" # Exclude dependabot changes
+      - "!.gitignore"
+      - "!.vtcodegitignore"
+      - "!.env*"
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: "-D warnings"
+
+# Set default shell and working directory
+defaults:
+  run:
+    shell: bash
+
+# ensure that the workflow is only triggered once per PR,  subsequent pushes to the PR will cancel
+# and restart the workflow. See https://docs.github.com/en/actions/using-jobs/using-concurrency
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+# Make obvious and fast tests to run first, to catch issues as early as possible
+jobs:
+  workflow-security:
+    name: Workflow Security Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Enforce workflow security invariants
+        run: bash scripts/check_workflow_security.sh
+
+  large-files:
+    name: Check Custom Invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check tracked file sizes
+        run: python3 scripts/check_large_files.py 400000
+      - name: Check markdown documentation location
+        run: python3 scripts/check_markdown_location.py
+      - name: Check core docs link integrity
+        run: python3 scripts/check_docs_links.py
+
+  zen-governance:
+    name: Zen Governance (Warn)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Rust file length baseline
+        run: python3 scripts/check_rust_file_length.py --mode warn --max-lines 500
+      - name: unwrap/expect baseline
+        run: python3 scripts/check_no_unwrap_expect_prod.py --mode warn --allowlist scripts/zen_allowlist.txt
+      - name: allowlist hygiene baseline
+        run: python3 scripts/check_zen_allowlist.py --mode warn --allowlist scripts/zen_allowlist.txt
+
+  unwrap-expect-enforcement:
+    name: Unwrap/Expect Enforcement
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Enforce production unwrap/expect policy
+        run: python3 scripts/check_no_unwrap_expect_prod.py --mode enforce --allowlist scripts/zen_allowlist.txt
+
+  # Lint the formatting of the codebase.
+  formatting:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Check for typos in the codebase.
+  # See <https://github.com/crate-ci/typos/>
+  # lint-typos:
+  #   name: Check Typos
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - uses: crate-ci/typos@master
+
+  # Check for any disallowed dependencies in the codebase due to license / security issues.
+  # See <https://github.com/EmbarkStudios/cargo-deny>
+  # dependencies:
+  #   name: Check Dependencies
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Run cargo clippy.
+  lint-clippy:
+    name: Check Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: "20G"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - run: cargo clippy --locked --jobs 4
+
+  # Check for unmaintained dependencies.
+  # See docs/guides/cargo-unmaintained.md for more information.
+  unmaintained:
+    name: Check Unmaintained Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cargo-unmaintained
+        uses: taiki-e/install-action@fae525311e5e299134b606bf247d465dd0df8190 # v2
+        with:
+          tool: cargo-unmaintained@1.10.0
+      - name: Check for unmaintained dependencies
+        run: cargo unmaintained --no-warnings
+
+  # Run markdownlint on all markdown files in the repository.
+  lint-markdown:
+    name: Check Markdown
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - id: filter
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+        with:
+          filters: |
+            markdown:
+              - '**/*.md'
+              - '!.github/workflows/*.yml'
+              - '!target/**'
+      - uses: DavidAnson/markdownlint-cli2-action@ded1f9488f68a970bc66ea5619e13e9b52e601cd # v23
+        if: steps.filter.outputs.markdown == 'true'
+        with:
+          globs: |
+            '**/*.md'
+            '!target'
+
+  check-cross-platform:
+    name: Cross-platform check ${{ matrix.os }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        toolchain: ["stable"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: "20G"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - run: cargo check --locked --jobs 4
+
+  check-windows:
+    name: Check Windows (warm cache)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: x86_64-pc-windows-msvc
+      - run: cargo check --locked --target x86_64-pc-windows-msvc --jobs 4
+        shell: bash
+
+  test:
+    name: "Cargo nextest"
+    runs-on: "ubuntu-latest"
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: "20G"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: "Check out the repo"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8" # stable
+        with:
+          toolchain: "stable"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fae525311e5e299134b606bf247d465dd0df8190 # nextest
+
+      - name: Run tests
+        run: cargo nextest run --locked --profile ci --cargo-profile ci
+
+      - name: Run focused harness PTY/TUI regressions
+        if: success() || failure()
+        run: |
+          cargo test --locked -p vtcode-core --test pty_tests
+          cargo test --locked -p vtcode-bash-runner --test pipe_tests
+          cargo test --locked -p vtcode --bin vtcode inline_events::tests
+
+  msrv:
+    name: MSRV Check (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae # nightly
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --locked --jobs 4
+
+  nightly:
+    name: Nightly Smoke Test
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_VERBOSE: false
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae # nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --locked --jobs 4
+
+  # clippy:
+  #   name: "Cargo clippy"
+  #   runs-on: "ubuntu-latest"
+  #   steps:
+  #     - name: "Check out the repo"
+  #       uses: actions/checkout@v6
+
+  #     - uses: "actions-rs/toolchain@v1"
+  #       with:
+  #         profile: "minimal"
+  #         toolchain: "stable"
+  #         override: true
+
+  #     - run: "rustup component add clippy"
+
+  #     - uses: "actions-rs/cargo@v1"
+  #       with:
+  #         command: "clippy"
+  #         args: "-- -D warnings"

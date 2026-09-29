@@ -1,0 +1,993 @@
+use crate::exec::events::{
+    AgentMessageItem, ErrorItem, ItemCompletedEvent, ItemStartedEvent, ItemUpdatedEvent, ReasoningItem, ThreadEvent,
+    ThreadItem, ThreadItemDetails, ToolCallStatus, ToolInvocationItem, ToolOutcome, ToolOutputItem,
+    tool_outcome_from_status,
+};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fmt::Write;
+
+#[derive(Debug, Clone, Default)]
+struct StreamingTextState {
+    item_id: Option<String>,
+    text: String,
+    started: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallStreamState {
+    item_id: String,
+    name: Option<String>,
+    arguments: String,
+    started: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Aggregated output from a tool execution, containing either inline text or a
+/// spool file reference.
+pub struct ToolOutputPayload {
+    /// Combined output text from the tool execution.
+    pub aggregated_output: String,
+    /// Optional path to a spool file containing the full output.
+    pub spool_path: Option<String>,
+}
+
+fn pluralize<'a>(count: u64, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+fn trimmed_string_field<'a>(output: &'a Value, key: &str) -> Option<&'a str> {
+    output
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+#[cold]
+fn trimmed_error_message(output: &Value) -> Option<&str> {
+    match output.get("error") {
+        Some(Value::String(message)) => Some(message.as_str()),
+        Some(Value::Object(error)) => error.get("message").and_then(Value::as_str),
+        _ => None,
+    }
+    .map(str::trim)
+    .filter(|text| !text.is_empty())
+}
+
+fn sample_strings_from_objects(items: &[Value], keys: &[&str], limit: usize) -> Vec<String> {
+    let mut samples = Vec::new();
+
+    for item in items {
+        let Some(value) = keys
+            .iter()
+            .find_map(|key| item.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+
+        if samples.iter().any(|sample| sample == value) {
+            continue;
+        }
+
+        samples.push(value.to_string());
+        if samples.len() >= limit {
+            break;
+        }
+    }
+
+    samples
+}
+
+fn match_path_text(item: &Value) -> Option<&str> {
+    item.get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            item.get("file")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
+        .or_else(|| {
+            item.get("data")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("path"))
+                .and_then(Value::as_object)
+                .and_then(|path| path.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
+}
+
+fn sample_match_paths(matches: &[Value], limit: usize) -> Vec<String> {
+    let mut samples = Vec::new();
+
+    for item in matches {
+        let Some(path) = match_path_text(item) else {
+            continue;
+        };
+
+        if samples.iter().any(|sample| sample == path) {
+            continue;
+        }
+
+        samples.push(path.to_string());
+        if samples.len() >= limit {
+            break;
+        }
+    }
+
+    samples
+}
+
+fn summarize_list_items(output: &Value, items: &[Value]) -> String {
+    let total = output
+        .get("total")
+        .or_else(|| output.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(items.len() as u64);
+
+    let (files, directories) =
+        items
+            .iter()
+            .fold((0u64, 0u64), |(files, directories), item| match item.get("type").and_then(Value::as_str) {
+                Some("file") => (files + 1, directories),
+                Some("directory") => (files, directories + 1),
+                _ => (files, directories),
+            });
+
+    let mut summary = format!("Listed {total} {}", pluralize(total, "item", "items"));
+    if files > 0 || directories > 0 {
+        let _ = write!(
+            summary,
+            " ({} {}, {} {})",
+            files,
+            pluralize(files, "file", "files"),
+            directories,
+            pluralize(directories, "directory", "directories"),
+        );
+    }
+
+    let samples = sample_strings_from_objects(items, &["path", "name"], 3);
+    if !samples.is_empty() {
+        let _ = write!(summary, ": {}", samples.join(", "));
+    }
+
+    summary
+}
+
+fn summarize_file_list(output: &Value, files: &[Value]) -> String {
+    let total = output.get("total").and_then(Value::as_u64).unwrap_or(files.len() as u64);
+    let mut summary = format!("Listed {total} {}", pluralize(total, "file", "files"));
+
+    let samples = files
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .take(3)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !samples.is_empty() {
+        let _ = write!(summary, ": {}", samples.join(", "));
+    }
+
+    summary
+}
+
+fn summarize_matches(output: &Value, matches: &[Value]) -> String {
+    let total = output
+        .get("total_match_count")
+        .or_else(|| output.get("matched_count"))
+        .or_else(|| output.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(matches.len() as u64);
+
+    if total == 0 {
+        return "No matches found".to_string();
+    }
+
+    let mut summary = format!("Found {total} {}", pluralize(total, "match", "matches"));
+
+    let samples = sample_match_paths(matches, 3);
+    if !samples.is_empty() {
+        let _ = write!(summary, " in {}", samples.join(", "));
+    } else if let Some(path) = trimmed_string_field(output, "path") {
+        let _ = write!(summary, " in {path}");
+    }
+
+    summary
+}
+
+fn append_unique_line(lines: &mut Vec<String>, line: &str) {
+    if !lines.iter().any(|existing| existing == line) {
+        lines.push(line.to_string());
+    }
+}
+
+/// Extract a [`ToolOutputPayload`] from a tool result JSON value, preferring
+/// spool path references and falling back to inline text aggregation.
+pub fn tool_output_payload_from_value(output: &Value) -> ToolOutputPayload {
+    if let Some(spool_path) = output.get("spool_path").and_then(Value::as_str) {
+        return ToolOutputPayload {
+            aggregated_output: String::new(),
+            spool_path: Some(spool_path.to_string()),
+        };
+    }
+
+    let mut primary_text = Vec::new();
+    for key in ["output", "stdout", "stderr", "content"] {
+        if let Some(text) = trimmed_string_field(output, key) {
+            append_unique_line(&mut primary_text, text);
+        }
+    }
+
+    if !primary_text.is_empty() {
+        return ToolOutputPayload {
+            aggregated_output: primary_text.join("\n"),
+            spool_path: None,
+        };
+    }
+
+    let structured_summary = if let Some(items) = output.get("items").and_then(Value::as_array) {
+        Some(summarize_list_items(output, items))
+    } else if let Some(files) = output.get("files").and_then(Value::as_array) {
+        Some(summarize_file_list(output, files))
+    } else if let Some(matches) = output.get("matches").and_then(Value::as_array) {
+        Some(summarize_matches(output, matches))
+    } else {
+        output
+            .as_object()
+            .map(|obj| {
+                obj.keys()
+                    .filter(|key| key.as_str() != "success")
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|keys| !keys.is_empty())
+            .map(|keys| format!("Structured result with fields: {}", keys.join(", ")))
+    };
+
+    let mut parts = Vec::new();
+    if let Some(summary) = structured_summary.as_deref() {
+        append_unique_line(&mut parts, summary);
+    }
+    if let Some(text) = trimmed_error_message(output) {
+        append_unique_line(&mut parts, text);
+    }
+    for key in ["message", "critical_note", "hint", "next_action"] {
+        if let Some(text) = trimmed_string_field(output, key) {
+            append_unique_line(&mut parts, text);
+        }
+    }
+
+    ToolOutputPayload {
+        aggregated_output: parts.join("\n"),
+        spool_path: None,
+    }
+}
+
+/// Shared lifecycle state for assistant text, reasoning, and model-emitted tool calls.
+#[derive(Debug, Default)]
+pub struct SharedLifecycleEmitter {
+    next_item_index: u64,
+    assistant: StreamingTextState,
+    reasoning: StreamingTextState,
+    reasoning_stage: Option<String>,
+    tool_calls: HashMap<String, ToolCallStreamState>,
+    pending_events: Vec<ThreadEvent>,
+}
+
+impl SharedLifecycleEmitter {
+    /// Generate the next unique item ID for lifecycle events.
+    #[must_use]
+    pub fn next_item_id(&mut self) -> String {
+        let id = self.next_item_index;
+        self.next_item_index += 1;
+        format!("item_{id}")
+    }
+
+    /// Emit a completed agent message event with the full text.
+    pub fn emit_completed_agent_message(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let item_id = self.next_item_id();
+        self.pending_events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
+            item: ThreadItem {
+                id: item_id,
+                details: ThreadItemDetails::AgentMessage(AgentMessageItem { text: text.to_string() }),
+            },
+        }));
+    }
+
+    /// Replace the current assistant streaming text. Returns `true` if the text changed.
+    pub fn replace_assistant_text(&mut self, text: &str) -> bool {
+        replace_stream_text(&mut self.assistant, text)
+    }
+
+    /// Whether the assistant text stream has been started.
+    #[must_use]
+    pub fn assistant_started(&self) -> bool {
+        self.assistant.started
+    }
+
+    /// Length of the accumulated assistant text in bytes.
+    #[must_use]
+    pub fn assistant_len(&self) -> usize {
+        self.assistant.text.len()
+    }
+
+    /// Append a delta to the assistant text stream. Returns `true` if content was added.
+    pub fn append_assistant_delta(&mut self, delta: &str) -> bool {
+        append_stream_delta(&mut self.assistant, delta)
+    }
+
+    /// Emit a snapshot of the current assistant text as an item event.
+    pub fn emit_assistant_snapshot(&mut self, item_id: Option<String>) -> bool {
+        let item_id = item_id.unwrap_or_else(|| self.next_item_id());
+        emit_text_snapshot(&mut self.pending_events, &mut self.assistant, item_id, |text| {
+            ThreadItemDetails::AgentMessage(AgentMessageItem { text })
+        })
+    }
+
+    /// Complete the assistant text stream, emitting a final completed event.
+    pub fn complete_assistant_stream(&mut self) -> bool {
+        complete_text_stream(&mut self.pending_events, &mut self.assistant, |text| {
+            ThreadItemDetails::AgentMessage(AgentMessageItem { text })
+        })
+    }
+
+    /// Emit a completed reasoning event with the full text.
+    pub fn emit_completed_reasoning(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let item_id = self.next_item_id();
+        self.pending_events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
+            item: ThreadItem {
+                id: item_id,
+                details: ThreadItemDetails::Reasoning(ReasoningItem {
+                    text: text.to_string(),
+                    stage: self.reasoning_stage.clone(),
+                }),
+            },
+        }));
+    }
+
+    /// Replace the current reasoning streaming text. Returns `true` if the text changed.
+    pub fn replace_reasoning_text(&mut self, text: &str) -> bool {
+        replace_stream_text(&mut self.reasoning, text)
+    }
+
+    /// Append a delta to the reasoning text stream. Returns `true` if content was added.
+    pub fn append_reasoning_delta(&mut self, delta: &str) -> bool {
+        append_stream_delta(&mut self.reasoning, delta)
+    }
+
+    /// Update the reasoning stage label. Returns `true` if the stage changed.
+    pub fn set_reasoning_stage(&mut self, stage: Option<String>) -> bool {
+        if self.reasoning_stage == stage {
+            return false;
+        }
+        self.reasoning_stage = stage;
+        true
+    }
+
+    /// Length of the accumulated reasoning text in bytes.
+    #[must_use]
+    pub fn reasoning_len(&self) -> usize {
+        self.reasoning.text.len()
+    }
+
+    /// Whether the reasoning text stream has been started.
+    #[must_use]
+    pub fn reasoning_started(&self) -> bool {
+        self.reasoning.started
+    }
+
+    /// Emit a snapshot of the current reasoning text as an item event.
+    pub fn emit_reasoning_snapshot(&mut self, item_id: Option<String>) -> bool {
+        let item_id = item_id.unwrap_or_else(|| self.next_item_id());
+        let stage = self.reasoning_stage.clone();
+        emit_text_snapshot(&mut self.pending_events, &mut self.reasoning, item_id, move |text| {
+            ThreadItemDetails::Reasoning(ReasoningItem { text, stage: stage.clone() })
+        })
+    }
+
+    /// Emit an update event reflecting the current reasoning stage.
+    pub fn emit_reasoning_stage_update(&mut self) -> bool {
+        if !self.reasoning.started {
+            return false;
+        }
+        let Some(item_id) = self.reasoning.item_id.clone() else {
+            return false;
+        };
+        self.pending_events.push(ThreadEvent::ItemUpdated(ItemUpdatedEvent {
+            item: ThreadItem {
+                id: item_id,
+                details: ThreadItemDetails::Reasoning(ReasoningItem {
+                    text: self.reasoning.text.clone(),
+                    stage: self.reasoning_stage.clone(),
+                }),
+            },
+        }));
+        true
+    }
+
+    /// Complete the reasoning text stream, emitting a final completed event.
+    pub fn complete_reasoning_stream(&mut self) -> bool {
+        let stage = self.reasoning_stage.clone();
+        complete_text_stream(&mut self.pending_events, &mut self.reasoning, move |text| {
+            ThreadItemDetails::Reasoning(ReasoningItem { text, stage: stage.clone() })
+        })
+    }
+
+    /// Start tracking a tool call, emitting an item-started event.
+    pub fn start_tool_call(&mut self, call_id: &str, tool_name: Option<String>, item_id: Option<String>) -> bool {
+        let generated_item_id = item_id.unwrap_or_else(|| self.next_item_id());
+        let buffer = self
+            .tool_calls
+            .entry(call_id.to_string())
+            .or_insert_with(|| ToolCallStreamState {
+                item_id: generated_item_id,
+                name: None,
+                arguments: String::new(),
+                started: false,
+            });
+
+        if buffer.name.is_none() {
+            buffer.name = tool_name;
+        }
+        if buffer.started {
+            return false;
+        }
+
+        buffer.started = true;
+        self.pending_events.push(tool_started_event(
+            buffer.item_id.clone(),
+            buffer.name.as_deref().unwrap_or_default(),
+            None,
+            Some(call_id),
+        ));
+        true
+    }
+
+    /// Append an argument delta to an in-progress tool call.
+    pub fn append_tool_call_delta(
+        &mut self,
+        call_id: &str,
+        delta: &str,
+        tool_name: Option<String>,
+        item_id: Option<String>,
+    ) -> bool {
+        if delta.is_empty() {
+            return false;
+        }
+
+        let generated_item_id = item_id.unwrap_or_else(|| self.next_item_id());
+        let buffer = self
+            .tool_calls
+            .entry(call_id.to_string())
+            .or_insert_with(|| ToolCallStreamState {
+                item_id: generated_item_id,
+                name: None,
+                arguments: String::new(),
+                started: false,
+            });
+
+        if !buffer.started {
+            buffer.started = true;
+            if buffer.name.is_none() {
+                buffer.name = tool_name;
+            }
+            self.pending_events.push(tool_started_event(
+                buffer.item_id.clone(),
+                buffer.name.as_deref().unwrap_or_default(),
+                None,
+                Some(call_id),
+            ));
+        } else if buffer.name.is_none() {
+            buffer.name = tool_name;
+        }
+
+        buffer.arguments.push_str(delta);
+        let arguments = progress_tool_arguments(&buffer.arguments);
+        self.pending_events.push(tool_invocation_updated_event(
+            buffer.item_id.clone(),
+            buffer.name.as_deref().unwrap_or_default(),
+            Some(&arguments),
+            Some(call_id),
+            ToolCallStatus::InProgress,
+        ));
+        true
+    }
+
+    pub fn complete_tool_call(&mut self, call_id: &str, status: ToolCallStatus, outcome: Option<ToolOutcome>) -> bool {
+        let Some(buffer) = self.tool_calls.remove(call_id) else {
+            return false;
+        };
+        if !buffer.started {
+            return false;
+        }
+
+        let arguments = if buffer.arguments.is_empty() {
+            None
+        } else {
+            Some(progress_tool_arguments(&buffer.arguments))
+        };
+        let resolved_outcome = outcome.unwrap_or_else(|| tool_outcome_from_status(&status));
+        self.pending_events.push(tool_invocation_completed_event(
+            buffer.item_id,
+            buffer.name.as_deref().unwrap_or_default(),
+            arguments.as_ref(),
+            Some(call_id),
+            status,
+            resolved_outcome,
+        ));
+        true
+    }
+
+    #[must_use]
+    pub fn tool_call_item_id(&self, call_id: &str) -> Option<&str> {
+        self.tool_calls.get(call_id).map(|buffer| buffer.item_id.as_str())
+    }
+
+    pub fn sync_tool_call_arguments(
+        &mut self,
+        call_id: &str,
+        arguments: &str,
+        tool_name: Option<String>,
+        item_id: Option<String>,
+    ) -> bool {
+        let generated_item_id = item_id.unwrap_or_else(|| self.next_item_id());
+        let buffer = self
+            .tool_calls
+            .entry(call_id.to_string())
+            .or_insert_with(|| ToolCallStreamState {
+                item_id: generated_item_id,
+                name: None,
+                arguments: String::new(),
+                started: false,
+            });
+
+        if buffer.name.is_none() {
+            buffer.name = tool_name;
+        }
+
+        if !buffer.started {
+            buffer.started = true;
+            self.pending_events.push(tool_started_event(
+                buffer.item_id.clone(),
+                buffer.name.as_deref().unwrap_or_default(),
+                None,
+                Some(call_id),
+            ));
+        }
+
+        if buffer.arguments == arguments {
+            return false;
+        }
+
+        buffer.arguments.clear();
+        buffer.arguments.push_str(arguments);
+        let args = progress_tool_arguments(&buffer.arguments);
+        self.pending_events.push(tool_invocation_updated_event(
+            buffer.item_id.clone(),
+            buffer.name.as_deref().unwrap_or_default(),
+            Some(&args),
+            Some(call_id),
+            ToolCallStatus::InProgress,
+        ));
+        true
+    }
+
+    pub fn complete_open_items(&mut self) {
+        self.complete_open_text_items();
+        self.complete_open_tool_calls_with_status(ToolCallStatus::Completed);
+    }
+
+    pub fn complete_open_text_items(&mut self) {
+        let _ = self.complete_assistant_stream();
+        let _ = self.complete_reasoning_stream();
+    }
+
+    pub fn complete_open_items_with_tool_status(&mut self, status: ToolCallStatus) {
+        self.complete_open_text_items();
+        self.complete_open_tool_calls_with_status(status);
+    }
+
+    pub fn complete_open_tool_calls_with_status(&mut self, status: ToolCallStatus) {
+        let call_ids = self.tool_calls.keys().cloned().collect::<Vec<_>>();
+        for call_id in call_ids {
+            let _ = self.complete_tool_call(&call_id, status.clone(), None);
+        }
+    }
+
+    #[must_use]
+    pub fn drain_events(&mut self) -> Vec<ThreadEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+}
+
+fn replace_stream_text(state: &mut StreamingTextState, text: &str) -> bool {
+    if state.text == text {
+        return false;
+    }
+    state.text.clear();
+    state.text.push_str(text);
+    true
+}
+
+fn append_stream_delta(state: &mut StreamingTextState, delta: &str) -> bool {
+    if delta.is_empty() {
+        return false;
+    }
+    state.text.push_str(delta);
+    true
+}
+
+fn emit_text_snapshot(
+    pending_events: &mut Vec<ThreadEvent>,
+    state: &mut StreamingTextState,
+    item_id: String,
+    build_details: impl FnOnce(String) -> ThreadItemDetails,
+) -> bool {
+    if state.text.trim().is_empty() {
+        return false;
+    }
+
+    let item_id = state.item_id.get_or_insert(item_id).clone();
+    let item = ThreadItem {
+        id: item_id,
+        details: build_details(state.text.clone()),
+    };
+
+    if state.started {
+        pending_events.push(ThreadEvent::ItemUpdated(ItemUpdatedEvent { item }));
+    } else {
+        state.started = true;
+        pending_events.push(ThreadEvent::ItemStarted(ItemStartedEvent { item }));
+    }
+    true
+}
+
+fn complete_text_stream(
+    pending_events: &mut Vec<ThreadEvent>,
+    state: &mut StreamingTextState,
+    build_details: impl FnOnce(String) -> ThreadItemDetails,
+) -> bool {
+    if !state.started {
+        return false;
+    }
+
+    let Some(item_id) = state.item_id.take() else {
+        state.started = false;
+        state.text.clear();
+        return false;
+    };
+
+    state.started = false;
+    let text = std::mem::take(&mut state.text);
+    pending_events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
+        item: ThreadItem { id: item_id, details: build_details(text) },
+    }));
+    true
+}
+
+#[must_use]
+pub fn tool_output_item_id(call_item_id: &str) -> String {
+    format!("{call_item_id}:output")
+}
+
+fn tool_invocation_item(
+    item_id: String,
+    tool_name: &str,
+    arguments: Option<&Value>,
+    tool_call_id: Option<&str>,
+    status: ToolCallStatus,
+    outcome: Option<ToolOutcome>,
+) -> ThreadItem {
+    ThreadItem {
+        id: item_id,
+        details: ThreadItemDetails::ToolInvocation(ToolInvocationItem {
+            tool_name: tool_name.to_string(),
+            arguments: arguments.cloned(),
+            tool_call_id: tool_call_id.map(str::to_string),
+            status,
+            outcome,
+        }),
+    }
+}
+
+fn tool_output_item(
+    call_item_id: &str,
+    tool_call_id: Option<&str>,
+    status: ToolCallStatus,
+    exit_code: Option<i32>,
+    spool_path: Option<&str>,
+    output: impl Into<String>,
+) -> ThreadItem {
+    ThreadItem {
+        id: tool_output_item_id(call_item_id),
+        details: ThreadItemDetails::ToolOutput(ToolOutputItem {
+            call_id: call_item_id.to_string(),
+            tool_call_id: tool_call_id.map(str::to_string),
+            spool_path: spool_path.map(str::to_string),
+            output: output.into(),
+            exit_code,
+            status,
+        }),
+    }
+}
+
+#[must_use]
+pub fn tool_started_event(
+    item_id: String,
+    tool_name: &str,
+    arguments: Option<&Value>,
+    tool_call_id: Option<&str>,
+) -> ThreadEvent {
+    ThreadEvent::ItemStarted(ItemStartedEvent {
+        item: tool_invocation_item(item_id, tool_name, arguments, tool_call_id, ToolCallStatus::InProgress, None),
+    })
+}
+
+#[must_use]
+pub fn tool_invocation_updated_event(
+    item_id: String,
+    tool_name: &str,
+    arguments: Option<&Value>,
+    tool_call_id: Option<&str>,
+    status: ToolCallStatus,
+) -> ThreadEvent {
+    ThreadEvent::ItemUpdated(ItemUpdatedEvent {
+        item: tool_invocation_item(item_id, tool_name, arguments, tool_call_id, status, None),
+    })
+}
+
+#[must_use]
+pub fn tool_invocation_completed_event(
+    item_id: String,
+    tool_name: &str,
+    arguments: Option<&Value>,
+    tool_call_id: Option<&str>,
+    status: ToolCallStatus,
+    outcome: ToolOutcome,
+) -> ThreadEvent {
+    ThreadEvent::ItemCompleted(ItemCompletedEvent {
+        item: tool_invocation_item(item_id, tool_name, arguments, tool_call_id, status, Some(outcome)),
+    })
+}
+
+#[must_use]
+pub fn tool_output_started_event(call_item_id: String, tool_call_id: Option<&str>) -> ThreadEvent {
+    ThreadEvent::ItemStarted(ItemStartedEvent {
+        item: tool_output_item(&call_item_id, tool_call_id, ToolCallStatus::InProgress, None, None, String::new()),
+    })
+}
+
+#[must_use]
+pub fn tool_output_updated_event(
+    call_item_id: String,
+    tool_call_id: Option<&str>,
+    output: impl Into<String>,
+) -> ThreadEvent {
+    ThreadEvent::ItemUpdated(ItemUpdatedEvent {
+        item: tool_output_item(&call_item_id, tool_call_id, ToolCallStatus::InProgress, None, None, output),
+    })
+}
+
+#[must_use]
+pub fn tool_output_completed_event(
+    call_item_id: String,
+    tool_call_id: Option<&str>,
+    status: ToolCallStatus,
+    exit_code: Option<i32>,
+    spool_path: Option<&str>,
+    output: impl Into<String>,
+) -> ThreadEvent {
+    ThreadEvent::ItemCompleted(ItemCompletedEvent {
+        item: tool_output_item(&call_item_id, tool_call_id, status, exit_code, spool_path, output),
+    })
+}
+
+#[must_use]
+#[cold]
+pub fn error_item_completed_event(item_id: String, message: impl Into<String>) -> ThreadEvent {
+    ThreadEvent::ItemCompleted(ItemCompletedEvent {
+        item: ThreadItem {
+            id: item_id,
+            details: ThreadItemDetails::Error(ErrorItem { message: message.into() }),
+        },
+    })
+}
+
+fn progress_tool_arguments(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn tool_started_event_omits_arguments_when_absent() {
+        let event = tool_started_event("item".to_string(), "shell", None, Some("call_1"));
+        let ThreadEvent::ItemStarted(ItemStartedEvent { item }) = event else {
+            panic!("expected started item");
+        };
+        let ThreadItemDetails::ToolInvocation(details) = item.details else {
+            panic!("expected tool invocation");
+        };
+        assert!(details.arguments.is_none());
+        assert_eq!(details.tool_name, "shell");
+    }
+
+    #[test]
+    fn tool_output_updated_event_streams_in_progress_output() {
+        let event = tool_output_updated_event("item".to_string(), Some("call_1"), "abc");
+        let ThreadEvent::ItemUpdated(ItemUpdatedEvent { item }) = event else {
+            panic!("expected updated item");
+        };
+        let ThreadItemDetails::ToolOutput(details) = item.details else {
+            panic!("expected tool output");
+        };
+        assert_eq!(details.call_id, "item");
+        assert_eq!(details.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(details.output, "abc");
+        assert_eq!(details.status, ToolCallStatus::InProgress);
+    }
+
+    #[test]
+    fn tool_output_payload_preserves_spool_reference() {
+        let payload = tool_output_payload_from_value(&json!({
+            "spool_path": ".vtcode/context/tool_outputs/run-1.txt",
+            "output": "ignored"
+        }));
+
+        assert_eq!(payload.aggregated_output, "");
+        assert_eq!(payload.spool_path.as_deref(), Some(".vtcode/context/tool_outputs/run-1.txt"));
+    }
+
+    #[test]
+    fn tool_output_payload_summarizes_list_results() {
+        let payload = tool_output_payload_from_value(&json!({
+            "items": [
+                {"name": "app.rs", "path": "vtcode-tui/src/app.rs", "type": "file"},
+                {"name": "core_tui", "path": "vtcode-tui/src/core_tui", "type": "directory"},
+                {"name": "lib.rs", "path": "vtcode-tui/src/lib.rs", "type": "file"}
+            ],
+            "count": 3,
+            "total": 11
+        }));
+
+        assert_eq!(payload.spool_path, None);
+        assert!(payload.aggregated_output.contains("Listed 11 items"));
+        assert!(payload.aggregated_output.contains("2 files, 1 directory"));
+        assert!(payload.aggregated_output.contains("vtcode-tui/src/app.rs"));
+    }
+
+    #[test]
+    fn tool_output_payload_combines_list_summary_with_message() {
+        let payload = tool_output_payload_from_value(&json!({
+            "items": [
+                {"name": "app.rs", "path": "vtcode-tui/src/app.rs", "type": "file"},
+                {"name": "core_tui", "path": "vtcode-tui/src/core_tui", "type": "directory"}
+            ],
+            "count": 2,
+            "total": 2,
+            "message": "[+3 more items]"
+        }));
+
+        assert!(payload.aggregated_output.contains("Listed 2 items"));
+        assert!(payload.aggregated_output.contains("[+3 more items]"));
+    }
+
+    #[test]
+    fn tool_output_payload_summarizes_match_results() {
+        let payload = tool_output_payload_from_value(&json!({
+            "matches": [
+                {"path": "src/main.rs", "line_number": 12},
+                {"file": "src/lib.rs", "line_number": 9}
+            ],
+            "total_match_count": 7
+        }));
+
+        assert_eq!(payload.spool_path, None);
+        assert!(payload.aggregated_output.contains("Found 7 matches"));
+        assert!(payload.aggregated_output.contains("src/main.rs"));
+        assert!(payload.aggregated_output.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn tool_output_payload_summarizes_nested_match_paths() {
+        let payload = tool_output_payload_from_value(&json!({
+            "matches": [
+                {
+                    "type": "match",
+                    "data": {
+                        "path": {"text": "vtcode-tui/src/core_tui/runner/mod.rs"},
+                        "line_number": 27,
+                        "lines": {"text": "runloop\n"}
+                    }
+                }
+            ],
+            "total_match_count": 1
+        }));
+
+        assert!(payload.aggregated_output.contains("Found 1 match"));
+        assert!(payload.aggregated_output.contains("vtcode-tui/src/core_tui/runner/mod.rs"));
+    }
+
+    #[test]
+    fn tool_output_payload_reports_empty_match_set() {
+        let payload = tool_output_payload_from_value(&json!({
+            "matches": [],
+            "path": "crates/codegen/vtcode-core/src"
+        }));
+
+        assert_eq!(payload.aggregated_output, "No matches found");
+        assert_eq!(payload.spool_path, None);
+    }
+
+    #[test]
+    fn tool_output_payload_includes_structured_recovery_guidance() {
+        let payload = tool_output_payload_from_value(&json!({
+            "matches": [],
+            "path": "src/agent",
+            "hint": "Pattern looks like a code fragment.",
+            "next_action": "Retry with a larger parseable pattern."
+        }));
+
+        assert!(payload.aggregated_output.contains("No matches found"));
+        assert!(payload.aggregated_output.contains("Pattern looks like a code fragment."));
+        assert!(payload.aggregated_output.contains("Retry with a larger parseable pattern."));
+    }
+
+    #[test]
+    fn tool_invocation_completed_event_embeds_outcome() {
+        let event = tool_invocation_completed_event(
+            "tool_1".to_string(),
+            "exec_command",
+            Some(&json!({"cmd": "pwd"})),
+            Some("call_1"),
+            ToolCallStatus::Failed,
+            ToolOutcome::HookDenied,
+        );
+        let ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) = event else {
+            panic!("expected completed item");
+        };
+        let ThreadItemDetails::ToolInvocation(details) = item.details else {
+            panic!("expected tool invocation");
+        };
+        assert_eq!(details.status, ToolCallStatus::Failed);
+        assert_eq!(details.outcome, Some(ToolOutcome::HookDenied));
+    }
+
+    #[test]
+    fn complete_tool_call_infers_outcome_from_status() {
+        let mut emitter = SharedLifecycleEmitter::default();
+        let call_id = "call_1".to_string();
+        emitter.start_tool_call(&call_id, Some("exec_command".to_string()), None);
+        emitter.sync_tool_call_arguments(&call_id, "{\"cmd\":\"pwd\"}", Some("exec_command".to_string()), None);
+        emitter.complete_tool_call(&call_id, ToolCallStatus::Completed, None);
+        let events = emitter.drain_events();
+        // events[0] = tool_started, events[1] = tool_invocation_updated, events[2] = tool_invocation_completed
+        let ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) = &events[2] else {
+            panic!("expected completed item at index 2, got {:?}", events[0]);
+        };
+        let ThreadItemDetails::ToolInvocation(details) = &item.details else {
+            panic!("expected tool invocation");
+        };
+        assert_eq!(details.outcome, Some(ToolOutcome::Success));
+    }
+}

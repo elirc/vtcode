@@ -1,0 +1,203 @@
+use serde_json::Value;
+use vtcode_core::config::constants::tools;
+
+use crate::agent::runloop::text_tools::canonical::{apply_exec_command_defaults, exec_command_defaults_for_name};
+use crate::agent::runloop::text_tools::parse_args::parse_textual_arguments;
+use crate::agent::runloop::text_tools::parser::{ParseResult, ParsedToolCall, TextualToolParser};
+
+pub(super) fn parse_channel_tool_call(text: &str) -> Option<(String, Value)> {
+    // Harmony format: <|start|>{header}<|message|>{content}<|end|>
+    // Tool calls are expected to include a recipient via `to=...` in the header.
+
+    for segment in text.split("<|start|>") {
+        let trimmed_segment = segment.trim();
+        if trimmed_segment.is_empty() {
+            continue;
+        }
+
+        let channel_idx = segment.find("<|channel|>");
+        let message_idx = segment.find("<|message|>");
+
+        if let (Some(c_idx), Some(m_idx)) = (channel_idx, message_idx)
+            && m_idx > c_idx
+        {
+            let header = &segment[..m_idx];
+            let Some(to_pos) = header.find("to=") else {
+                continue;
+            };
+
+            let stop_idx = segment
+                .find("<|call|>")
+                .or_else(|| segment.find("<|end|>"))
+                .or_else(|| segment.find("<|return|>"))
+                .unwrap_or(segment.len());
+
+            let content_raw = segment[m_idx + "<|message|>".len()..stop_idx].trim();
+
+            let after_to = &header[to_pos + 3..];
+            let tool_ref = after_to.split(|c: char| c.is_whitespace() || c == '<').next().unwrap_or("");
+            let tool_name = parse_tool_name_from_reference(tool_ref);
+            if tool_name.is_empty() {
+                continue;
+            }
+
+            if let Some(parsed) = parse_textual_arguments(content_raw)
+                && let Ok(args) = convert_harmony_args_to_tool_format(tool_name, parsed)
+            {
+                return Some((tool_name.to_string(), args));
+            }
+        }
+    }
+
+    None
+}
+
+pub(super) fn parse_tool_name_from_reference(tool_ref: &str) -> &str {
+    match tool_ref {
+        "repo_browser.list_files" | tools::LIST_FILES => tools::LIST_FILES,
+        "repo_browser.read_file" | tools::READ_FILE => tools::READ_FILE,
+        "repo_browser.write_file" | tools::WRITE_FILE => tools::WRITE_FILE,
+        "container.exec" | "exec" | "bash" | "exec_command" => tools::EXEC_COMMAND,
+        "grep" => tools::GREP_FILE,
+        _ => {
+            // Try to extract the function name after the last dot
+            if let Some(dot_pos) = tool_ref.rfind('.') {
+                &tool_ref[dot_pos + 1..]
+            } else {
+                tool_ref
+            }
+        }
+    }
+}
+
+pub(super) fn convert_harmony_args_to_tool_format(tool_name: &str, parsed: Value) -> Result<Value, String> {
+    if let Some(defaults) = exec_command_defaults_for_name(tool_name) {
+        let mut result = serde_json::Map::new();
+        apply_exec_command_defaults(&mut result, defaults);
+
+        // Preserve other parameters from the original parsed object
+        if let Some(map) = parsed.as_object() {
+            for (key, value) in map {
+                if key != "cmd" && key != "command" && key != "action" {
+                    result.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+
+        if matches!(defaults.action, "list" | "close" | "poll" | "write")
+            && parsed.get("cmd").is_none()
+            && parsed.get("command").is_none()
+        {
+            return Ok(Value::Object(result));
+        }
+
+        let command = normalized_harmony_command(&parsed)?
+            .ok_or_else(|| "no 'cmd' or 'command' parameter provided".to_string())?;
+        result.insert("command".to_string(), command);
+        Ok(Value::Object(result))
+    } else {
+        match tool_name {
+            tools::LIST_FILES => {
+                // Convert harmony list_files format to vtcode format
+                let mut args = serde_json::Map::new();
+
+                if let Some(path) = parsed.get("path") {
+                    args.insert("path".to_string(), path.clone());
+                }
+
+                if let Some(recursive) = parsed.get("recursive") {
+                    args.insert("recursive".to_string(), recursive.clone());
+                }
+
+                Ok(Value::Object(args))
+            }
+            _ => Ok(parsed),
+        }
+    }
+}
+
+fn normalized_harmony_command(parsed: &Value) -> Result<Option<Value>, String> {
+    parsed
+        .get("cmd")
+        .or_else(|| parsed.get("command"))
+        .map(normalize_harmony_command_value)
+        .transpose()
+}
+
+fn normalize_harmony_command_value(command: &Value) -> Result<Value, String> {
+    match command {
+        Value::String(command) => {
+            if command.trim().is_empty() {
+                Err("command executable cannot be empty".to_string())
+            } else {
+                Ok(Value::String(command.clone()))
+            }
+        }
+        Value::Array(values) => {
+            let command = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| "command array must contain only strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if command.first().map(|part| part.trim().is_empty()).unwrap_or(true) {
+                Err("command executable cannot be empty".to_string())
+            } else {
+                Ok(serde_json::json!(command))
+            }
+        }
+        _ => Err("command must be a string or array of strings".to_string()),
+    }
+}
+
+/// Collects channel-format tool-call regions for stripping.
+pub(super) fn collect_channel_regions(text: &str, regions: &mut Vec<(usize, usize)>) {
+    let mut search_start = 0usize;
+    while let Some(relative_start) = text[search_start..].find("<|start|>") {
+        let start = search_start + relative_start;
+        let tail = &text[start..];
+        let end = tail
+            .find("<|call|>")
+            .map(|idx| start + idx + "<|call|>".len())
+            .or_else(|| tail.find("<|end|>").map(|idx| start + idx + "<|end|>".len()))
+            .or_else(|| tail.find("<|return|>").map(|idx| start + idx + "<|return|>".len()))
+            .unwrap_or(text.len());
+        if start < end && end <= text.len() {
+            regions.push((start, end));
+        }
+        search_start = end.max(start + "<|start|>".len());
+    }
+}
+
+/// Parser for Harmony/GPT-OSS channel format tool calls.
+pub(crate) struct ChannelToolParser;
+
+impl TextualToolParser for ChannelToolParser {
+    fn name(&self) -> &'static str {
+        "channel"
+    }
+
+    fn try_parse(&self, text: &str) -> ParseResult {
+        match parse_channel_tool_call(text) {
+            Some((name, args)) => ParseResult::Success(ParsedToolCall { name, args }),
+            None => {
+                tracing::debug!(
+                    parser = "channel",
+                    reason = "no matching <|start|> pattern",
+                    "Rejected textual tool call"
+                );
+                ParseResult::Reject("no matching <|start|> pattern")
+            }
+        }
+    }
+
+    fn find_consumed_spans(&self, text: &str) -> Vec<(usize, usize)> {
+        let mut regions = Vec::new();
+        collect_channel_regions(text, &mut regions);
+        regions
+    }
+}

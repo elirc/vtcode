@@ -1,0 +1,263 @@
+//! Inter-process communication for calling MCP tools from executing code.
+//!
+//! This module provides a file-based IPC mechanism that allows code running in
+//! a separate process to call MCP tools. The code writes tool requests to a file, and
+//! the executor reads and processes them, writing back results.
+//!
+//! Optionally supports PII (Personally Identifiable Information) protection by
+//! tokenizing sensitive data in requests before tool execution and de-tokenizing
+//! responses before returning to the code.
+//!
+//! # Protocol
+//!
+//! Requests (code → executor):
+//! ```json
+//! {
+//!   "id": "uuid",
+//!   "tool_name": "search_tools",
+//!   "args": {"keyword": "file"}
+//! }
+//! ```
+//!
+//! Responses (executor → code):
+//! ```json
+//! {
+//!   "id": "uuid",
+//!   "success": true,
+//!   "result": {...}
+//! }
+//! ```
+//! or
+//! ```json
+//! {
+//!   "id": "uuid",
+//!   "success": false,
+//!   "error": "Tool not found"
+//! }
+//! ```
+//!
+//! # PII Protection
+//!
+//! When enabled, the handler automatically:
+//! 1. Detects PII patterns in request arguments
+//! 2. Tokenizes sensitive data before tool execution
+//! 3. De-tokenizes responses before returning to code
+//! 4. Maintains token mapping for the session
+
+use crate::utils::file_utils::{parse_json_with_context, read_file_with_context, write_file_with_context};
+use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::fs;
+use tokio::time::sleep;
+use uuid::Uuid;
+
+use crate::tools::request_response::{ToolCallRequest, ToolCallResponse};
+
+const REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// IPC request from executing code to executor.
+pub type ToolRequest = ToolCallRequest;
+
+/// IPC response from executor to executing code.
+pub type ToolResponse = ToolCallResponse;
+
+/// IPC handler for tool invocation between code and executor.
+pub struct ToolIpcHandler {
+    ipc_dir: PathBuf,
+    pii_tokenizer: Option<Arc<crate::exec::PiiTokenizer>>,
+}
+
+impl ToolIpcHandler {
+    /// Create a new IPC handler with the given directory.
+    pub fn new(ipc_dir: PathBuf) -> Self {
+        Self { ipc_dir, pii_tokenizer: None }
+    }
+
+    /// Create a new IPC handler with PII protection enabled.
+    pub fn with_pii_protection(ipc_dir: PathBuf) -> Result<Self> {
+        Ok(Self {
+            ipc_dir,
+            pii_tokenizer: Some(Arc::new(crate::exec::PiiTokenizer::new()?)),
+        })
+    }
+
+    /// Enable PII protection on existing handler.
+    pub fn enable_pii_protection(&mut self) -> Result<()> {
+        self.pii_tokenizer = Some(Arc::new(crate::exec::PiiTokenizer::new()?));
+        Ok(())
+    }
+
+    /// Read a tool request from the code.
+    pub async fn read_request(&self) -> Result<Option<ToolRequest>> {
+        let request_file = self.ipc_dir.join("request.json");
+
+        if !request_file.exists() {
+            return Ok(None);
+        }
+
+        let content = read_file_with_context(&request_file, "request file").await?;
+        let request: ToolRequest = parse_json_with_context(&content, "request JSON")?;
+
+        // Clean up request file
+        let _ = fs::remove_file(&request_file).await;
+
+        Ok(Some(request))
+    }
+
+    /// Process request for PII (tokenize if enabled).
+    pub fn process_request_for_pii(&self, request: &mut ToolRequest) -> Result<()> {
+        if let Some(tokenizer) = &self.pii_tokenizer {
+            let args_str = serde_json::to_string(&request.args).context("failed to serialize request args")?;
+            let (tokenized, _) = tokenizer.tokenize_string(&args_str).context("PII tokenization failed")?;
+            request.args = parse_json_with_context(&tokenized, "tokenized args")?;
+        }
+        Ok(())
+    }
+
+    /// Process response for PII (de-tokenize if enabled).
+    pub fn process_response_for_pii(&self, response: &mut ToolResponse) -> Result<()> {
+        if let Some(tokenizer) = &self.pii_tokenizer
+            && let Some(result) = &response.result
+        {
+            let result_str = serde_json::to_string(result).context("failed to serialize response result")?;
+            let detokenized = tokenizer.detokenize_string(&result_str).context("PII de-tokenization failed")?;
+            response.result = Some(parse_json_with_context(&detokenized, "de-tokenized result")?);
+        }
+        Ok(())
+    }
+
+    /// Write a tool response back to the code.
+    pub async fn write_response(&self, mut response: ToolResponse) -> Result<()> {
+        // De-tokenize response before writing back to code
+        self.process_response_for_pii(&mut response)?;
+
+        let response_file = self.ipc_dir.join("response.json");
+
+        let json = serde_json::to_string(&response).context("failed to serialize response")?;
+
+        write_file_with_context(&response_file, &json, "response file").await?;
+
+        Ok(())
+    }
+
+    /// Wait for a request with timeout.
+    pub async fn wait_for_request(&self, timeout: Duration) -> Result<Option<ToolRequest>> {
+        let start = std::time::Instant::now();
+
+        loop {
+            if let Some(request) = self.read_request().await? {
+                return Ok(Some(request));
+            }
+
+            let Some(remaining_timeout) = timeout.checked_sub(start.elapsed()) else {
+                return Ok(None);
+            };
+
+            sleep(remaining_timeout.min(REQUEST_POLL_INTERVAL)).await;
+        }
+    }
+
+    /// Create a request ID.
+    pub fn new_request_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+    use tokio::time::Instant;
+
+    #[test]
+    fn serialize_tool_request() {
+        let request = ToolRequest {
+            id: "test-id".into(),
+            tool_name: "read_file".into(),
+            args: json!({"path": "/test"}),
+            metadata: None,
+        };
+
+        let json = serde_json::to_string(&request).expect("ToolRequest should serialize");
+        assert!(json.contains("test-id"));
+        assert!(json.contains("read_file"));
+    }
+
+    #[test]
+    fn serialize_success_response() {
+        let response = ToolResponse {
+            id: "test-id".into(),
+            success: true,
+            result: Some(json!({"data": "test"})),
+            error: None,
+            duration_ms: None,
+            cache_hit: None,
+        };
+
+        let json = serde_json::to_string(&response).expect("ToolResponse should serialize");
+        assert!(json.contains("test-id"));
+        assert!(json.contains("true"));
+        assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn serialize_error_response() {
+        let response = ToolResponse {
+            id: "test-id".into(),
+            success: false,
+            result: None,
+            error: Some("File not found".into()),
+            duration_ms: None,
+            cache_hit: None,
+        };
+
+        let json = serde_json::to_string(&response).expect("ToolResponse should serialize");
+        assert!(json.contains("test-id"));
+        assert!(json.contains("false"));
+        assert!(json.contains("File not found"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_request_reads_delayed_request() {
+        let temp_dir = tempdir().expect("temp dir should create");
+        let handler = ToolIpcHandler::new(temp_dir.path().to_path_buf());
+        let request = ToolRequest {
+            id: "test-id".into(),
+            tool_name: "read_file".into(),
+            args: json!({"path": "/tmp/test"}),
+            metadata: None,
+        };
+        let request_json = serde_json::to_string(&request).expect("request should serialize to JSON");
+        let request_path = temp_dir.path().join("request.json");
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            fs::write(request_path, request_json).await.expect("request file should write");
+        });
+
+        let received = handler
+            .wait_for_request(Duration::from_millis(200))
+            .await
+            .expect("request wait should succeed");
+
+        assert_eq!(received.expect("request should arrive").id, "test-id");
+    }
+
+    #[tokio::test]
+    async fn wait_for_request_respects_short_timeout() {
+        let temp_dir = tempdir().expect("temp dir should create");
+        let handler = ToolIpcHandler::new(temp_dir.path().to_path_buf());
+        let start = Instant::now();
+
+        let received = handler
+            .wait_for_request(Duration::from_millis(5))
+            .await
+            .expect("request wait should succeed");
+
+        assert!(received.is_none());
+        assert!(start.elapsed() < Duration::from_millis(40));
+    }
+}

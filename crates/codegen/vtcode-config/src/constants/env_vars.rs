@@ -1,0 +1,36 @@
+pub const GEMINI_BASE_URL: &str = "GEMINI_BASE_URL";
+pub const OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
+pub const HUGGINGFACE_BASE_URL: &str = "HUGGINGFACE_BASE_URL";
+pub const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
+pub const OPENROUTER_BASE_URL: &str = "OPENROUTER_BASE_URL";
+pub const XAI_BASE_URL: &str = "XAI_BASE_URL";
+pub const DEEPSEEK_BASE_URL: &str = "DEEPSEEK_BASE_URL";
+pub const MISTRAL_BASE_URL: &str = "MISTRAL_BASE_URL";
+pub const Z_AI_BASE_URL: &str = "Z_AI_BASE_URL";
+pub const ZAI_BASE_URL: &str = "ZAI_BASE_URL";
+pub const MOONSHOT_BASE_URL: &str = "MOONSHOT_BASE_URL";
+pub const LMSTUDIO_BASE_URL: &str = "LMSTUDIO_BASE_URL";
+pub const LLAMACPP_BASE_URL: &str = "LLAMACPP_BASE_URL";
+pub const LLAMACPP_BINARY_PATH: &str = "LLAMACPP_BINARY_PATH";
+pub const LLAMACPP_MODEL_PATH: &str = "LLAMACPP_MODEL_PATH";
+pub const LLAMACPP_EXTRA_ARGS: &str = "LLAMACPP_EXTRA_ARGS";
+pub const LLAMACPP_STARTUP_TIMEOUT_SECONDS: &str = "LLAMACPP_STARTUP_TIMEOUT_SECONDS";
+pub const OLLAMA_BASE_URL: &str = "OLLAMA_BASE_URL";
+pub const MIMO_BASE_URL: &str = "MIMO_BASE_URL";
+pub const MIMO_TOKEN_PLAN_BASE_URL: &str = "MIMO_TOKEN_PLAN_BASE_URL";
+pub const MIMO_TOKEN_PLAN_KEY: &str = "MIMO_TOKEN_PLAN_KEY";
+pub const MINIMAX_BASE_URL: &str = "MINIMAX_BASE_URL";
+pub const OPENRESPONSES_BASE_URL: &str = "OPENRESPONSES_BASE_URL";
+pub const LITELLM_BASE_URL: &str = "LITELLM_BASE_URL";
+
+pub const OPENCODE_ZEN_BASE_URL: &str = "OPENCODE_ZEN_BASE_URL";
+pub const OPENCODE_GO_BASE_URL: &str = "OPENCODE_GO_BASE_URL";
+pub const QWEN_BASE_URL: &str = "QWEN_BASE_URL";
+pub const STEPFUN_BASE_URL: &str = "STEPFUN_BASE_URL";
+pub const EVOLINK_BASE_URL: &str = "EVOLINK_BASE_URL";
+pub const POOLSIDE_BASE_URL: &str = "POOLSIDE_BASE_URL";
+
+/// Environment variable for setting maximum thinking budget tokens
+/// Set to 63999 to get 2x the default thinking budget on 64K output models
+/// See: <https://decodeclaude.com/ultrathink-deprecated/>
+pub const MAX_THINKING_TOKENS: &str = "MAX_THINKING_TOKENS";

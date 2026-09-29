@@ -1,0 +1,205 @@
+use anyhow::{Context, Result, anyhow};
+use std::process::Command;
+
+use super::debug_log;
+
+pub(super) fn install_with_smart_detection() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if command_exists("brew") {
+            tracing::info!(method = "homebrew", "installing ripgrep");
+            debug_log("Attempting installation via Homebrew");
+            return install_via_homebrew();
+        }
+        if command_exists("cargo") {
+            tracing::info!(method = "cargo", "installing ripgrep");
+            debug_log("Attempting installation via Cargo");
+            return install_via_cargo();
+        }
+        Err(anyhow!("No supported installer found. Install Homebrew or Cargo, or install ripgrep manually."))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if command_exists("apt") || command_exists("apt-get") {
+            tracing::info!(method = "apt", "installing ripgrep");
+            debug_log("Attempting installation via APT");
+            if install_via_apt().is_ok() {
+                return Ok(());
+            }
+            debug_log("APT installation failed, trying fallback");
+        }
+        if command_exists("cargo") {
+            tracing::info!(method = "cargo", "installing ripgrep");
+            debug_log("Attempting installation via Cargo (fallback)");
+            return install_via_cargo();
+        }
+        Err(anyhow!("No supported installer found. Install APT, Cargo, or install ripgrep manually."))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if command_exists("cargo") {
+            tracing::info!(method = "cargo", "installing ripgrep");
+            debug_log("Attempting installation via Cargo");
+            if install_via_cargo().is_ok() {
+                return Ok(());
+            }
+            debug_log("Cargo installation failed, trying fallback");
+        }
+        if command_exists("choco") {
+            tracing::info!(method = "chocolatey", "installing ripgrep");
+            debug_log("Attempting installation via Chocolatey (fallback)");
+            if install_via_chocolatey().is_ok() {
+                return Ok(());
+            }
+            debug_log("Chocolatey installation failed, trying Scoop");
+        }
+        if command_exists("scoop") {
+            tracing::info!(method = "scoop", "installing ripgrep");
+            debug_log("Attempting installation via Scoop (fallback)");
+            return install_via_scoop();
+        }
+        return Err(anyhow!("No supported installer found. Install Cargo, Chocolatey, or Scoop."));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(anyhow!("Unsupported platform for automatic ripgrep installation"))
+    }
+}
+
+fn command_exists(cmd: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "where", cmd])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("which")
+            .arg(cmd)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_via_homebrew() -> Result<()> {
+    let output = Command::new("brew")
+        .arg("install")
+        .arg("ripgrep")
+        .output()
+        .context("Failed to execute brew install ripgrep")?;
+
+    if output.status.success() {
+        tracing::info!(method = "homebrew", "ripgrep installed successfully");
+        Ok(())
+    } else {
+        Err(anyhow!("Homebrew installation failed: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_via_apt() -> Result<()> {
+    // Check if we're already running as root (skip sudo if so)
+    let is_root = nix::unistd::getuid().is_root();
+
+    if is_root {
+        // Running as root, no sudo needed
+        tracing::info!(method = "apt", "running as root, skipping sudo");
+        let _ = Command::new("apt").args(["update"]).output();
+
+        let output = Command::new("apt")
+            .args(["install", "-y", "ripgrep"])
+            .output()
+            .context("Failed to execute apt install ripgrep")?;
+
+        if output.status.success() {
+            tracing::info!(method = "apt", "ripgrep installed successfully");
+            Ok(())
+        } else {
+            Err(anyhow!("apt installation failed: {}", String::from_utf8_lossy(&output.stderr)))
+        }
+    } else {
+        // Need sudo - log a warning about elevated privileges
+        tracing::warn!(method = "apt", "using sudo to install ripgrep - this requires elevated privileges");
+
+        // Check if sudo is available
+        let sudo_ok = Command::new("sudo")
+            .args(["-n", "true"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !sudo_ok {
+            return Err(anyhow!(
+                "sudo is required to install ripgrep via apt, but is not available or requires a password. \
+                 Please install ripgrep manually or run with sudo."
+            ));
+        }
+
+        let _ = Command::new("sudo").args(["apt", "update"]).output();
+
+        let output = Command::new("sudo")
+            .args(["apt", "install", "-y", "ripgrep"])
+            .output()
+            .context("Failed to execute apt install ripgrep")?;
+
+        if output.status.success() {
+            tracing::info!(method = "apt", "ripgrep installed successfully");
+            Ok(())
+        } else {
+            Err(anyhow!("apt installation failed: {}", String::from_utf8_lossy(&output.stderr)))
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn install_via_cargo() -> Result<()> {
+    let output = Command::new("cargo")
+        .args(["install", "ripgrep"])
+        .output()
+        .context("Failed to execute cargo install ripgrep")?;
+
+    if output.status.success() {
+        tracing::info!(method = "cargo", "ripgrep installed successfully");
+        Ok(())
+    } else {
+        Err(anyhow!("cargo installation failed: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_via_chocolatey() -> Result<()> {
+    let output = Command::new("choco")
+        .args(["install", "-y", "ripgrep"])
+        .output()
+        .context("Failed to execute choco install ripgrep")?;
+
+    if output.status.success() {
+        tracing::info!(method = "chocolatey", "ripgrep installed successfully");
+        Ok(())
+    } else {
+        Err(anyhow!("Chocolatey installation failed: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_via_scoop() -> Result<()> {
+    let output = Command::new("scoop")
+        .args(["install", "ripgrep"])
+        .output()
+        .context("Failed to execute scoop install ripgrep")?;
+
+    if output.status.success() {
+        tracing::info!(method = "scoop", "ripgrep installed successfully");
+        Ok(())
+    } else {
+        Err(anyhow!("Scoop installation failed: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}

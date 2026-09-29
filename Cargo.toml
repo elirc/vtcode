@@ -1,0 +1,485 @@
+[package]
+name = "vtcode"
+version = "0.136.4"
+edition = "2024"
+rust-version = "1.93.0"
+authors = ["Vinh Nguyen <vinhnguyen2308@gmail.com>"]
+description = "A Rust-based terminal coding agent with modular architecture supporting multiple LLM providers"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/vinhnx/vtcode"
+repository = "https://github.com/vinhnx/vtcode"
+documentation = "https://docs.rs/vtcode"
+keywords = ["ai", "coding", "agent", "llm", "cli"]
+categories = ["command-line-utilities", "development-tools", "api-bindings"]
+exclude = [
+    "target/",
+    ".github/",
+    "docs/**",
+    "!docs/config/CONFIG_FIELD_REFERENCE.md",
+    "scripts/",
+    "screenshots/",
+    "logs/",
+    "/prompts/",
+    "dist/",
+    "npm/",
+    "resources/",
+]
+default-run = "vtcode"
+
+[lints]
+workspace = true
+
+# Override sections to consolidate duplicate dependencies
+[workspace.dependencies]
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+base64 = "0.22.1"
+crossterm = "0.29"
+schemars = "1.2"
+thiserror = "2.0.18"
+unicode-width = "0.2.0"
+vt100 = "0.16"
+serde_json = "1.0"
+tempfile = "3.27"
+tokio = { version = "1.52", features = ["full"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive", "rc"] }
+regex = "1.12"
+num_cpus = "1.16"
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+libc = "0.2"
+rand = "0.10"
+semver = "1.0"
+fs2 = "0.4"
+hashbrown = { version = "0.17", features = ["serde"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+rustc-hash = "2.1"
+keyring-core = "1"
+libloading = "0.9"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+compact_str = { version = "0.9", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+assert_fs = "1.1"
+futures = "0.3"
+once_cell = "1.21"
+indexmap = { version = "2.13", features = ["serde"] }
+async-trait = "0.1.89"
+anstyle = "1.0"
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+ratatui-cheese = "0.7"
+toml = "1.0.6"
+sha2 = "0.11"
+anstyle-git = "1.1"
+tokio-util = "0.7"
+tracing-subscriber = "0.3"
+criterion = "0.8"
+serde-saphyr = "0.0.28"
+serial_test = "3.5"
+dotenvy = "0.15"
+strsim = "0.11"
+dirs = "6.0"
+smallvec = "1.13"
+path-clean = "1.0"
+shell-words = "1.1"
+dialoguer = "0.12.0"
+dunce = "1.0"
+itertools = "0.15.0"
+memchr = "2.8"
+url = "2.5"
+agent-client-protocol = { version = "=1.0.1", features = ["unstable_auth_methods"] }
+uuid = "1.23.2"
+ignore = "0.4"
+ring = "0.17"
+pretty_assertions = "1.4"
+proc-macro2 = "1"
+quote = "1"
+syn = "2"
+linkme = "0.3"
+webbrowser = "1.2"
+tiktoken = "3.5"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+tracing-opentelemetry = "0.33"
+
+# Internal workspace crates
+vtcode-commons = { path = "crates/common/vtcode-commons", version = "0.136.4" }
+vtcode-acp = { path = "crates/codegen/vtcode-acp", version = "0.136.4" }
+vtcode-auth = { path = "crates/codegen/vtcode-auth", version = "0.136.4" }
+vtcode-config = { path = "crates/codegen/vtcode-config", version = "0.136.4" }
+vtcode-core = { path = "crates/codegen/vtcode-core", version = "0.136.4" }
+vtcode-ui = { path = "crates/codegen/vtcode-ui", version = "0.136.4" }
+vtcode-indexer = { path = "crates/codegen/vtcode-indexer", version = "0.136.4" }
+vtcode-bash-runner = { path = "crates/codegen/vtcode-bash-runner", version = "0.136.4" }
+vtcode-exec-events = { path = "crates/common/vtcode-exec-events", version = "0.136.4" }
+vtcode-safety = { path = "crates/codegen/vtcode-safety", version = "0.136.4" }
+vtcode-a2a = { path = "crates/codegen/vtcode-a2a", version = "0.136.4" }
+vtcode-mcp = { path = "crates/codegen/vtcode-mcp", version = "0.136.4" }
+vtcode-llm = { path = "crates/codegen/vtcode-llm", version = "0.136.4" }
+vtcode-skills = { path = "crates/codegen/vtcode-skills", version = "0.136.4" }
+vtcode-memory = { path = "crates/codegen/vtcode-memory", version = "0.136.4" }
+vtcode-eval = { path = "crates/codegen/vtcode-eval", version = "0.136.4" }
+vtcode-macros = { path = "crates/common/vtcode-macros", version = "0.136.4" }
+vtcode-utility-tool-specs = { path = "crates/common/vtcode-utility-tool-specs", version = "0.136.4" }
+
+[workspace.package]
+version = "0.136.4"
+edition = "2024"
+rust-version = "1.93.0"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/vinhnx/vtcode"
+repository = "https://github.com/vinhnx/vtcode"
+documentation = "https://docs.rs/vtcode"
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/common/vtcode-commons",
+    "crates/common/vtcode-exec-events",
+    "crates/common/vtcode-macros",
+    "crates/common/vtcode-utility-tool-specs",
+    "crates/codegen/vtcode-acp",
+    "crates/codegen/vtcode-a2a",
+    "crates/codegen/vtcode-auth",
+    "crates/codegen/vtcode-bash-runner",
+    "crates/codegen/vtcode-config",
+    "crates/codegen/vtcode-core",
+    "crates/codegen/vtcode-eval",
+    "crates/codegen/vtcode-indexer",
+    "crates/codegen/vtcode-llm",
+    "crates/codegen/vtcode-mcp",
+    "crates/codegen/vtcode-safety",
+    "crates/codegen/vtcode-memory",
+    "crates/codegen/vtcode-skills",
+    "crates/codegen/vtcode-ui",
+    "crates/codegen/xtask",
+]
+default-members = [
+    ".",
+    "crates/codegen/vtcode-core",
+    "crates/codegen/vtcode-ui",
+]
+exclude = [
+    "extensions/zed-extension",
+    "fuzz",
+]
+
+[patch.crates-io]
+vtcode-commons = { path = "crates/common/vtcode-commons" }
+vtcode-acp = { path = "crates/codegen/vtcode-acp" }
+vtcode-auth = { path = "crates/codegen/vtcode-auth" }
+vtcode-config = { path = "crates/codegen/vtcode-config" }
+vtcode-core = { path = "crates/codegen/vtcode-core" }
+vtcode-ui = { path = "crates/codegen/vtcode-ui" }
+vtcode-indexer = { path = "crates/codegen/vtcode-indexer" }
+vtcode-bash-runner = { path = "crates/codegen/vtcode-bash-runner" }
+vtcode-exec-events = { path = "crates/common/vtcode-exec-events" }
+vtcode-safety = { path = "crates/codegen/vtcode-safety" }
+vtcode-a2a = { path = "crates/codegen/vtcode-a2a" }
+vtcode-mcp = { path = "crates/codegen/vtcode-mcp" }
+vtcode-llm = { path = "crates/codegen/vtcode-llm" }
+vtcode-skills = { path = "crates/codegen/vtcode-skills" }
+vtcode-memory = { path = "crates/codegen/vtcode-memory" }
+vtcode-eval = { path = "crates/codegen/vtcode-eval" }
+
+[workspace.lints]
+# Rust compiler lints
+rust.unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)', 'cfg(feature, values("schema", "default", "tui"))'] }
+rust.unused_extern_crates = "warn"
+rust.unused_import_braces = "warn"
+rust.unused_qualifications = "warn"
+rust.unused_results = "allow"  # Too verbose for development
+rust.trivial_numeric_casts = "warn"
+rust.unsafe_code = "warn"
+rust.unstable_features = "warn"
+rust.missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
+# Note: string_slice and indexing_slicing are phased in; high-noise on existing codebase.
+string_slice = "allow"  # TODO: Phase in after cleanup pass
+indexing_slicing = "allow"  # TODO: Phase in after cleanup pass
+collapsible_if = "allow"  # Widespread across codebase, fix on-demand
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+get_unwrap = "warn"
+unwrap_in_result = "allow"
+unchecked_time_subtraction = "warn"
+panic_in_result_fn = "allow"
+
+# Don't Fail Silently - prevent dropped futures and swallowed errors
+let_underscore_future = "warn"
+let_underscore_must_use = "allow"  # TODO: Audit intentional drops (mostly safe write! calls & cleanup)
+unused_result_ok = "allow"
+map_err_ignore = "warn"
+assertions_on_result_states = "allow"
+
+# Don't Do Bad Async Stuff - prevent deadlocks and concurrency bugs
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+if_let_mutex = "warn"
+large_futures = "warn"
+
+# Don't Do Unsafe Things with Memory
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_safety_comment = "warn"
+
+# Don't Do Potentially Incorrect Things with Numbers
+# Integer overflow in Rust: arithmetic panics in debug, wraps as two's complement in release.
+# Prefer checked_*, saturating_*, wrapping_* methods over raw arithmetic when overflow is
+# a concern. Performance intuition: overflow checking is near-zero cost with proper compiler
+# optimization — range analysis eliminates unnecessary checks, and late lowering avoids
+# inhibiting optimizations (see docs/development/rust-performance-principles.md).
+# See https://huonw.github.io/blog/2016/04/myths-and-legends-about-integer-overflow-in-rust/
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+cast_sign_loss = "warn"
+invalid_upcast_comparisons = "warn"
+cast_possible_truncation = "allow"  # TODO: Phase in after overflow audit
+cast_possible_wrap = "allow"  # TODO: Phase in after overflow audit
+
+# Don't Do Bad Things That are Easy to Avoid
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+fallible_impl_from = "warn"
+dbg_macro = "warn"
+
+# Don't `allow` Your Way Around These Lints
+# Note: These require manual curation of all existing suppressions.
+allow_attributes = "allow"  # TODO: Phase in after suppression audit
+allow_attributes_without_reason = "allow"  # TODO: Phase in after suppression audit
+
+
+[dependencies]
+vtcode-acp = { path = "crates/codegen/vtcode-acp", version = "0.136.4" }
+vtcode-commons = { path = "crates/common/vtcode-commons", version = "0.136.4" }
+vtcode-ui = { path = "crates/codegen/vtcode-ui", version = "0.136.4" }
+vtcode-config = { path = "crates/codegen/vtcode-config", version = "0.136.4" }
+vtcode-auth = { path = "crates/codegen/vtcode-auth", version = "0.136.4" }
+vtcode-core = { path = "crates/codegen/vtcode-core", version = "0.136.4", default-features = false }
+vtcode-memory = { path = "crates/codegen/vtcode-memory", version = "0.136.4" }
+vtcode-eval = { path = "crates/codegen/vtcode-eval", version = "0.136.4" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+webbrowser = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
+serde = { workspace = true }
+toml = { workspace = true }
+futures = { workspace = true }
+itertools = { workspace = true }
+memchr = { workspace = true }
+tempfile = { workspace = true }
+once_cell = { workspace = true }
+chrono = { workspace = true } # For timestamp handling in CLI
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+async-trait = { workspace = true }
+async-stream = "0.3"
+# Home directory detection
+dirs = { workspace = true }
+nix = { version = "0.31", features = ["user", "process", "resource"] }
+# Hashing for large output file paths
+sha2 = { workspace = true }
+# ANSI styling
+anstyle = { workspace = true }
+colorchoice = "1.0"
+shell-words = { workspace = true }
+dialoguer = { workspace = true }
+crossterm = { workspace = true }
+hashbrown = { workspace = true }
+ratatui = { workspace = true }
+regex = { workspace = true }
+rustc-hash = { workspace = true }
+unicode-width = { workspace = true }
+url = { workspace = true }
+smallvec = "1.13"
+self_update = { version = "0.43", default-features = false, features = ["archive-tar", "compression-flate2", "rustls", "reqwest"] }
+reqwest = { workspace = true }
+semver = { workspace = true }
+thiserror = { workspace = true }
+axum = { version = "0.8" }
+serde-saphyr = { workspace = true }
+mimalloc = { version = "0.1", default-features = false }
+tikv-jemallocator = { version = "0.6", optional = true, features = ["background_threads"] }
+
+[features]
+default = ["tool-chat", "desktop-notifications"]
+tool-chat = []
+profiling = []
+# Opt into jemalloc (background-thread purging) on any platform. Recommended for
+# Linux servers/containers, where it returns memory to the OS between bursty/sparse
+# idle gaps. On macOS `background_thread` is unsupported, so jemalloc pins like
+# mimalloc there; the default allocator is mimalloc. See src/allocator.rs and
+# `vtcode bench-allocator`.
+allocator-jemalloc = ["dep:tikv-jemallocator"]
+anthropic-api = ["vtcode-core/anthropic-api"]
+a2a-server = ["vtcode-core/a2a-server"]   # Enable OAuth callback server for provider authentication
+desktop-notifications = ["vtcode-core/desktop-notifications"]
+
+[[bench]]
+name = "allocator_throughput"
+harness = false
+
+[profile.dev]
+debug = 0
+lto = false
+# incremental = false required for sccache; set CARGO_INCREMENTAL=1 to override for rapid iteration
+incremental = false
+opt-level = 0
+# More codegen units = more parallelism for dependency codegen during check/clippy
+codegen-units = 256
+# Split debuginfo for faster incremental builds (when CARGO_INCREMENTAL=1)
+split-debuginfo = "unpacked"
+
+[profile.test]
+inherits = "dev"
+# Explicitly enable overflow checks during tests to catch bugs early.
+overflow-checks = true
+
+# Optimize build dependencies for faster proc-macro execution
+[profile.dev.build-override]
+opt-level = 3
+codegen-units = 16
+
+# Optimize dependencies slightly (they're cached anyway)
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.dev-optimized]
+inherits = "dev"
+lto = "thin"
+codegen-units = 1
+opt-level = 2
+
+# Fast dev profile with better runtime performance than plain `dev`.
+# Use `cargo build --profile dev-fast` when you need a faster binary
+# during development without paying the full release LTO cost.
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 1
+lto = false
+codegen-units = 16
+
+# Fast release profile - thin LTO for ~50% faster builds than full LTO
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+
+[profile.release]
+codegen-units = 1 # Allows compiler to perform better optimization.
+lto = true        # Enables Link-time Optimization for better performance and size reduction.
+opt-level = 3     # Optimize for performance on M4 (was "s" for size)
+strip = true      # Ensures debug symbols are removed.
+panic = "abort"   # Reduce size of panic paths.
+# Keep asserts active in shipped binaries: a violated invariant must crash loud,
+# not let the program run under wrong assumptions. Disabling asserts in prod
+# lets falsifiable invariants fester and misbehave silently. See kristoff.it/blog/fix-your-asserts.
+debug-assertions = true
+overflow-checks = true
+# Additional performance optimizations:
+incremental = false # Disable incremental compilation for better optimization
+
+# CI-specific profile for faster builds with minimal debug info
+[profile.ci]
+inherits = "dev"
+# Copy settings from dev profile but with minimal debug info
+debug = 0
+incremental = false
+overflow-checks = false
+
+[profile.bench]
+# Optimize benchmarks for accurate performance measurement
+codegen-units = 1
+lto = true
+opt-level = 3
+debug = false
+incremental = false
+
+# Profile for bloaty analysis - optimized but with debug info
+[profile.bloaty]
+inherits = "release"
+debug = true
+strip = false
+
+# Hardened release profile for shipping to end users (alpha + stable).
+# Use `cargo build --profile release-dist` for distribution builds.
+# Not used by default `--release` to avoid slowing down local dev builds (~2.2x).
+#
+# Hardening: thin LTO for cross-crate optimization with reasonable link times,
+# codegen-units=1 maximizes optimization (whole-program analysis, no CGU boundaries).
+# debug=1 emits line-tables DWARF; strip=false keeps symbols so CI can extract
+# .debug sidecars (Linux) or .dSYM bundles (macOS) before stripping post-build.
+[profile.release-dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = false
+debug = 1
+split-debuginfo = "off"
+
+# Desktop release profile. Functionally identical to release-dist — kept as a
+# named alias so the desktop workflow can reference it without coupling to the
+# CLI pipeline's profile name. Alpha and stable share a single release-dist
+# profile so that stable promotion can pointer-swap the alpha binary without
+# rebuilding.
+[profile.release-dist-jemalloc]
+inherits = "release-dist"
+# All settings now match the parent — this is an intentional alias.
+
+# Production profile for latency-sensitive services.
+# Thin LTO gives ~90% of full LTO benefit at significantly faster link time.
+# Keeps symbols + line tables for prod debuggability (perf, flamegraph, stack traces).
+[profile.x-prod]
+inherits = "release"
+lto = "thin"
+strip = false
+codegen-units = 1
+debug = "line-tables-only"
+panic = "unwind"
+
+
+[[bin]]
+name = "vtcode"
+path = "src/main.rs"
+
+[dev-dependencies]
+criterion = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+assert_fs = { workspace = true }
+indexmap = { workspace = true }
+rand = "0.9"
+regex = { workspace = true }
+assert_cmd = "2.1"
+predicates = "3.1"
+insta = "1.39"
+serial_test = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = []
+
+[package.metadata.unmaintained]
+# Ignore known unmaintained packages (add packages as needed)
+# Example: ignore = ["some-crate"]
+ignore = []
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+rustc-args = ["--cfg", "docsrs"]
+rustdoc-args = ["--cfg", "docsrs"]

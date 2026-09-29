@@ -1,0 +1,228 @@
+use anyhow::Result;
+use serde_json::Value;
+use vtcode_core::config::ToolOutputMode;
+use vtcode_core::config::constants::tools;
+use vtcode_core::config::loader::VTCodeConfig;
+use vtcode_core::tools::tool_intent;
+use vtcode_core::utils::ansi::{AnsiRenderer, MessageStyle};
+
+use super::commands_processing::{parse_command_tokens, preprocess_terminal_stdout};
+use super::render_tool_follow_up_hints;
+use super::streams::{render_stream_section, resolve_stdout_tail_limit};
+use super::styles::{GitStyles, LsStyles};
+
+fn resolve_pty_session_id(payload: &Value) -> Option<&str> {
+    payload
+        .get("id")
+        .or_else(|| payload.get("session_id"))
+        .or_else(|| payload.get("process_id"))
+        .and_then(Value::as_str)
+}
+
+fn infer_pty_completion(payload: &Value, session_id: Option<&str>, exit_code: Option<i64>) -> bool {
+    payload
+        .get("is_exited")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| exit_code.is_some() || session_id.is_none())
+}
+
+pub(crate) async fn render_terminal_command_panel(
+    renderer: &mut AnsiRenderer,
+    payload: &Value,
+    git_styles: &GitStyles,
+    ls_styles: &LsStyles,
+    vt_config: Option<&VTCodeConfig>,
+    allow_ansi: bool,
+) -> Result<()> {
+    // Check if stdout is JSON containing command output (from execute_code tool).
+    // Avoid cloning the entire payload upfront - only parse inner JSON if needed.
+    let stdout_raw = payload.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let stderr_raw = payload.get("stderr").and_then(Value::as_str).unwrap_or("");
+
+    // If stdout looks like JSON with stdout/stderr/returncode, unwrap it
+    let owned_inner;
+    let (stdout_raw, stderr_raw, unwrapped_payload) = if let Ok(inner_json) = serde_json::from_str::<Value>(stdout_raw)
+        && (inner_json.get("stdout").is_some()
+            || inner_json.get("stderr").is_some()
+            || inner_json.get("returncode").is_some())
+    {
+        owned_inner = inner_json;
+        let s = owned_inner.get("stdout").and_then(Value::as_str).unwrap_or("");
+        let e = owned_inner.get("stderr").and_then(Value::as_str).unwrap_or("");
+        (s, e, &owned_inner)
+    } else {
+        (stdout_raw, stderr_raw, payload)
+    };
+
+    let output_raw = unwrapped_payload.get("output").and_then(Value::as_str).unwrap_or("");
+    let command_tokens = parse_command_tokens(unwrapped_payload);
+    let disable_spool = unwrapped_payload.get("no_spool").and_then(Value::as_bool).unwrap_or(false);
+
+    // Check for session completion status (is_exited indicates if process is still running)
+    let exit_code = unwrapped_payload.get("exit_code").and_then(Value::as_i64);
+    let session_id = resolve_pty_session_id(unwrapped_payload);
+    let is_completed = infer_pty_completion(unwrapped_payload, session_id, exit_code);
+    let command = if let Some(tokens) = &command_tokens {
+        tokens.join(" ")
+    } else {
+        unwrapped_payload
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+
+    // If there's an 'output' field, this is likely a PTY session result
+    let is_pty_session =
+        session_id.is_some() && (!output_raw.is_empty() || stdout_raw.is_empty() && stderr_raw.is_empty());
+
+    let stdout = if is_pty_session {
+        preprocess_terminal_stdout(command_tokens.as_deref(), output_raw)
+    } else {
+        preprocess_terminal_stdout(command_tokens.as_deref(), stdout_raw)
+    };
+    let stderr = preprocess_terminal_stdout(command_tokens.as_deref(), stderr_raw);
+    let critical_note = unwrapped_payload
+        .get("critical_note")
+        .and_then(Value::as_str)
+        .filter(|note| !note.trim().is_empty());
+
+    let output_mode = vt_config.map(|cfg| cfg.ui.tool_output_mode).unwrap_or(ToolOutputMode::Compact);
+    let tail_limit = resolve_stdout_tail_limit(vt_config);
+
+    // Render stdin if available and different from command (avoid repeating the "• Ran" header)
+    if let Some(stdin) = unwrapped_payload.get("stdin").and_then(Value::as_str)
+        && !stdin.trim().is_empty()
+    {
+        let stdin_trimmed = stdin.trim();
+        if stdin_trimmed != command.trim() {
+            let prompt = format!("$ {stdin_trimmed}");
+            renderer.line(MessageStyle::ToolDetail, &prompt)?;
+        }
+    }
+
+    // Keep inline streaming behavior only while the PTY is still running.
+    // Once completed, always render the final captured output.
+    let inline_streaming = is_pty_session && renderer.prefers_untruncated_output() && !is_completed;
+    let render_spool_reference_only =
+        is_completed && tool_intent::should_use_spool_reference_only(None, unwrapped_payload);
+
+    if !render_spool_reference_only && stdout.trim().is_empty() && stderr.trim().is_empty() && critical_note.is_none() {
+        if !inline_streaming && (!is_pty_session || is_completed) {
+            renderer.line(MessageStyle::ToolDetail, "(no output)")?;
+        } else if is_pty_session && !is_completed {
+            // For running PTY sessions with no output yet, don't show "no output"
+            // since the process may still be starting up or processing
+        }
+        return Ok(());
+    }
+
+    // Render stdout/PTY output.
+    if !render_spool_reference_only && !stdout.trim().is_empty() && !inline_streaming {
+        let label = if is_pty_session { "" } else { "stdout" }; // Don't label PTY output as stdout
+        render_stream_section(
+            renderer,
+            label,
+            stdout.as_ref(),
+            output_mode,
+            tail_limit,
+            Some(tools::RUN_PTY_CMD),
+            git_styles,
+            ls_styles,
+            MessageStyle::ToolOutput, // Tool output (dimmed in TUI reflow)
+            allow_ansi,
+            disable_spool,
+            vt_config,
+        )
+        .await?;
+    }
+
+    // Render stderr if present, even for PTY sessions
+    if !render_spool_reference_only && !inline_streaming && !stderr.trim().is_empty() {
+        render_stream_section(
+            renderer,
+            "stderr",
+            stderr.as_ref(),
+            output_mode,
+            tail_limit,
+            Some(tools::RUN_PTY_CMD),
+            git_styles,
+            ls_styles,
+            MessageStyle::ToolError, // Error output
+            allow_ansi,
+            disable_spool,
+            vt_config,
+        )
+        .await?;
+    }
+
+    if let Some(note) = critical_note {
+        if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+            renderer.line(MessageStyle::ToolDetail, "")?;
+        }
+        renderer.line(MessageStyle::ToolError, note)?;
+    }
+
+    // Add session completion note if completed
+    if is_pty_session && is_completed {
+        let exit_badge = if let Some(code) = exit_code {
+            if code == 0 {
+                "exit 0".to_string()
+            } else {
+                format!("exit {code}")
+            }
+        } else {
+            "done".to_string()
+        };
+        renderer.line(MessageStyle::ToolDetail, &format!("✓ {exit_badge}"))?;
+    }
+
+    let rendered_follow_up_body = [
+        (!render_spool_reference_only && !inline_streaming && !stdout.trim().is_empty()).then_some(stdout.as_ref()),
+        (!render_spool_reference_only && !inline_streaming && !stderr.trim().is_empty()).then_some(stderr.as_ref()),
+        critical_note,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    let rendered_follow_up_body = if rendered_follow_up_body.is_empty() {
+        None
+    } else {
+        Some(rendered_follow_up_body)
+    };
+
+    render_tool_follow_up_hints(renderer, unwrapped_payload, rendered_follow_up_body.as_deref())?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{infer_pty_completion, resolve_pty_session_id};
+    use serde_json::json;
+
+    #[test]
+    fn resolves_pty_session_id_with_fallback_keys() {
+        let from_id = json!({ "id": "run-1" });
+        assert_eq!(resolve_pty_session_id(&from_id), Some("run-1"));
+
+        let from_session = json!({ "session_id": "run-2" });
+        assert_eq!(resolve_pty_session_id(&from_session), Some("run-2"));
+
+        let from_process = json!({ "process_id": "run-3" });
+        assert_eq!(resolve_pty_session_id(&from_process), Some("run-3"));
+    }
+
+    #[test]
+    fn infers_running_state_without_is_exited() {
+        let payload = json!({ "process_id": "run-1" });
+        assert!(!infer_pty_completion(&payload, Some("run-1"), None));
+    }
+
+    #[test]
+    fn infers_completed_state_from_exit_code() {
+        let payload = json!({ "id": "run-1", "exit_code": 0 });
+        assert!(infer_pty_completion(&payload, Some("run-1"), Some(0)));
+    }
+}

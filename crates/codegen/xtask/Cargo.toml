@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.136.4"
+edition = "2024"
+publish = false
+
+[dependencies]
+vtcode-core = { path = "../vtcode-core" }
+clap = { workspace = true, features = ["derive"] }
+clap_complete = { workspace = true }
+semver = { workspace = true }
+toml_edit = "0.25"

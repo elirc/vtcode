@@ -1,0 +1,119 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename_all = "lowercase"))]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum StatusLineMode {
+    /// Automatic status line: displays git branch, model name, and context remaining (default)
+    #[default]
+    Auto,
+    /// Command mode: executes custom shell command to render status line
+    Command,
+    /// Hidden mode: disables the status line entirely
+    Hidden,
+    /// Catch-all for unknown modes added by future versions.
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::str::FromStr for StatusLineMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" => Ok(StatusLineMode::Auto),
+            "command" => Ok(StatusLineMode::Command),
+            "hidden" => Ok(StatusLineMode::Hidden),
+            _ => Ok(StatusLineMode::Unknown),
+        }
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StatusLineConfig {
+    #[serde(default = "default_status_line_mode")]
+    pub mode: StatusLineMode,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default = "default_status_line_refresh_interval_ms")]
+    pub refresh_interval_ms: u64,
+    #[serde(default = "default_status_line_command_timeout_ms")]
+    pub command_timeout_ms: u64,
+}
+
+impl StatusLineConfig {
+    /// Get the effective status line mode, using defaults for unset values.
+    ///
+    /// Following Codex PR #12015's pattern for default configuration fallback,
+    /// this method ensures that when a status line config is not explicitly set,
+    /// sensible defaults are applied (automatic status line by default).
+    pub fn effective_mode(&self) -> StatusLineMode {
+        self.mode.clone()
+    }
+}
+
+impl Default for StatusLineConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_status_line_mode(),
+            command: None,
+            refresh_interval_ms: default_status_line_refresh_interval_ms(),
+            command_timeout_ms: default_status_line_command_timeout_ms(),
+        }
+    }
+}
+
+/// Returns the default status line mode when not explicitly configured.
+///
+/// This is the fallback when `tui.status_line` config is unset (pattern from Codex PR #12015).
+pub const DEFAULT_STATUS_LINE_MODE: StatusLineMode = StatusLineMode::Auto;
+
+fn default_status_line_mode() -> StatusLineMode {
+    DEFAULT_STATUS_LINE_MODE
+}
+
+fn default_status_line_refresh_interval_ms() -> u64 {
+    crate::constants::ui::STATUS_LINE_REFRESH_INTERVAL_MS
+}
+
+fn default_status_line_command_timeout_ms() -> u64 {
+    crate::constants::ui::STATUS_LINE_COMMAND_TIMEOUT_MS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatusLineMode;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Wrapper {
+        mode: StatusLineMode,
+    }
+
+    #[test]
+    fn deserializes_lowercase_status_line_mode() {
+        for (input, expected) in [
+            ("\"auto\"", StatusLineMode::Auto),
+            ("\"command\"", StatusLineMode::Command),
+            ("\"hidden\"", StatusLineMode::Hidden),
+        ] {
+            let parsed: Wrapper =
+                toml::from_str(&format!("mode = {input}")).expect("lowercase status line mode must parse");
+            assert_eq!(parsed.mode, expected, "input {input}");
+        }
+    }
+
+    #[test]
+    fn serializes_lowercase_status_line_mode() {
+        for (mode, expected) in [
+            (StatusLineMode::Auto, "\"auto\""),
+            (StatusLineMode::Command, "\"command\""),
+            (StatusLineMode::Hidden, "\"hidden\""),
+        ] {
+            let serialized = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(serialized, expected);
+        }
+    }
+}

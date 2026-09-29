@@ -1,0 +1,270 @@
+//! Tool output processing helpers for ToolRegistry.
+
+use serde_json::{Value, json};
+
+use super::ToolRegistry;
+
+const PTY_FORCE_SPOOL_MIN_BYTES: usize = 12_000;
+
+fn is_pty_output_tool(tool_name: &str) -> bool {
+    crate::tools::tool_intent::canonical_command_session_tool_name(tool_name).is_some()
+}
+
+fn output_field_bytes(value: &Value) -> usize {
+    value
+        .get("raw_output")
+        .and_then(|v| v.as_str())
+        .map(str::len)
+        .or_else(|| value.get("output").and_then(|v| v.as_str()).map(str::len))
+        .or_else(|| value.get("stdout").and_then(|v| v.as_str()).map(str::len))
+        .unwrap_or(0)
+}
+
+fn should_force_spool(tool_name: &str, value: &Value, is_mcp: bool, spooling_enabled: bool) -> bool {
+    if !spooling_enabled || is_mcp || !is_pty_output_tool(tool_name) {
+        return false;
+    }
+    if value.get("no_spool").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return false;
+    }
+    if value.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return true;
+    }
+    output_field_bytes(value) >= PTY_FORCE_SPOOL_MIN_BYTES
+}
+
+impl ToolRegistry {
+    fn sanitize_tool_output(value: Value, is_mcp: bool) -> Value {
+        let (entry_fuse, depth_fuse, token_fuse, byte_fuse) = Self::fuse_limits();
+
+        let trimmed = Self::clamp_value_recursive(&value, entry_fuse, depth_fuse);
+
+        let serialized = trimmed.to_string();
+        let approx_tokens = serialized.len() / 4;
+        if serialized.len() > byte_fuse || approx_tokens > token_fuse {
+            let truncated = serialized.chars().take(byte_fuse).collect::<String>();
+            return json!({
+                "content": truncated,
+                "truncated": true,
+                "note": if is_mcp {
+                    "MCP tool result truncated to protect context budget"
+                } else {
+                    "Tool result truncated to protect context budget"
+                },
+                "approx_tokens": approx_tokens,
+                "byte_fuse": byte_fuse
+            });
+        }
+        trimmed
+    }
+
+    fn clamp_value_recursive(value: &Value, entry_fuse: usize, depth: usize) -> Value {
+        if depth == 0 {
+            return value.clone();
+        }
+        match value {
+            Value::Array(arr) => {
+                if arr.is_empty() {
+                    return Value::Array(Vec::new());
+                }
+                let overflow = arr.len().saturating_sub(entry_fuse);
+                let trimmed: Vec<Value> = arr
+                    .iter()
+                    .take(entry_fuse)
+                    .map(|v| Self::clamp_value_recursive(v, entry_fuse, depth - 1))
+                    .collect();
+                if overflow > 0 {
+                    let approx_tokens = trimmed.iter().map(|v| v.to_string().len() / 4).sum::<usize>();
+                    json!({
+                        "truncated": true,
+                        "note": "Array truncated to protect context budget",
+                        "total_entries": arr.len(),
+                        "entries": trimmed,
+                        "overflow": overflow,
+                        "approx_tokens": approx_tokens
+                    })
+                } else {
+                    Value::Array(trimmed)
+                }
+            }
+            Value::Object(map) => {
+                if map.is_empty() {
+                    return Value::Object(serde_json::Map::new());
+                }
+                let overflow = map.len().saturating_sub(entry_fuse);
+                let mut head = serde_json::Map::new();
+                for (k, v) in map.iter().take(entry_fuse) {
+                    head.insert(k.clone(), Self::clamp_value_recursive(v, entry_fuse, depth - 1));
+                }
+                if overflow > 0 {
+                    let approx_tokens = head.iter().map(|(k, v)| (k.len() + v.to_string().len()) / 4).sum::<usize>();
+                    json!({
+                        "truncated": true,
+                        "note": "Object truncated to protect context budget",
+                        "total_entries": map.len(),
+                        "entries": head,
+                        "overflow": overflow,
+                        "approx_tokens": approx_tokens
+                    })
+                } else {
+                    Value::Object(head)
+                }
+            }
+            _ => value.clone(),
+        }
+    }
+
+    fn fuse_limits() -> (usize, usize, usize, usize) {
+        let entry_fuse = std::env::var("VTCODE_FUSE_ENTRY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 10)
+            .unwrap_or(200);
+        let depth_fuse = std::env::var("VTCODE_FUSE_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(3);
+        let token_fuse = std::env::var("VTCODE_FUSE_TOKEN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1_000)
+            .unwrap_or(50_000);
+        let byte_fuse = std::env::var("VTCODE_FUSE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 10_000)
+            .unwrap_or(200_000);
+        (entry_fuse, depth_fuse, token_fuse, byte_fuse)
+    }
+
+    /// Process tool output with dynamic context discovery.
+    ///
+    /// This method implements Cursor-style dynamic context discovery:
+    /// 1. First checks if output should be spooled to a file (large outputs)
+    /// 2. If spooled, returns a file reference instead of truncated content
+    /// 3. Otherwise, applies standard sanitization
+    ///
+    /// This is more token-efficient as agents can inspect spooled files with
+    /// shell commands or use `code_search` for code structure on demand.
+    pub(super) async fn process_tool_output(&self, tool_name: &str, value: Value, is_mcp: bool) -> Value {
+        let spooling_enabled = self.output_spooler.config().enabled;
+        let force_spool = should_force_spool(tool_name, &value, is_mcp, spooling_enabled);
+
+        // Check if output should be spooled to file
+        if force_spool || self.output_spooler.should_spool(&value) {
+            match self
+                .output_spooler
+                .process_output_with_force(tool_name, value.clone(), is_mcp, force_spool)
+                .await
+            {
+                Ok(spooled) => return spooled,
+                Err(e) => {
+                    // Log error but fall back to standard sanitization
+                    tracing::warn!(
+                        tool = tool_name,
+                        error = %e,
+                        "Failed to spool tool output to file, falling back to truncation"
+                    );
+                }
+            }
+        }
+
+        Self::sanitize_tool_output(value, is_mcp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::constants::tools;
+
+    #[test]
+    fn force_spool_for_truncated_pty_output() {
+        let value = json!({
+            "output": "x",
+            "truncated": true
+        });
+        assert!(should_force_spool("run_pty_cmd", &value, false, true));
+    }
+
+    #[test]
+    fn force_spool_for_large_pty_output() {
+        let value = json!({
+            "output": "x".repeat(PTY_FORCE_SPOOL_MIN_BYTES + 1)
+        });
+        assert!(should_force_spool("run_pty_cmd", &value, false, true));
+    }
+
+    #[test]
+    fn skip_force_spool_when_disabled_or_non_pty() {
+        let no_spool_value = json!({
+            "output": "x".repeat(PTY_FORCE_SPOOL_MIN_BYTES + 1),
+            "no_spool": true
+        });
+        assert!(!should_force_spool("run_pty_cmd", &no_spool_value, false, true));
+
+        let non_pty_value = json!({
+            "output": "x".repeat(PTY_FORCE_SPOOL_MIN_BYTES + 1)
+        });
+        assert!(!should_force_spool(tools::GREP_FILE, &non_pty_value, false, true));
+        assert!(!should_force_spool("run_pty_cmd", &non_pty_value, false, false));
+    }
+
+    #[tokio::test]
+    async fn process_tool_output_skips_force_spool_when_dynamic_context_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("vtcode.toml"), "[context.dynamic]\nenabled = false\n").unwrap();
+        let registry = ToolRegistry::new(temp.path().to_path_buf()).await;
+        let value = json!({
+            "output": "x".repeat(PTY_FORCE_SPOOL_MIN_BYTES + 1),
+            "truncated": true
+        });
+
+        let result = registry.process_tool_output("run_pty_cmd", value.clone(), false).await;
+
+        assert!(result.get("spool_path").is_none());
+        assert_eq!(result.get("output"), value.get("output"));
+    }
+
+    #[tokio::test]
+    async fn large_outputs_from_any_tool_spool_to_path_with_guidance() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::new(temp.path().to_path_buf()).await;
+
+        // Representative tool types: search, file read, web fetch, exec, and an MCP tool.
+        // Every one must land on disk as a `spool_path` the model can post-process
+        // (unified_file, code_search, or unified_exec) instead of being inlined.
+        let tool_names = [
+            tools::CODE_SEARCH,
+            tools::UNIFIED_FILE,
+            tools::WEB_FETCH,
+            tools::UNIFIED_EXEC,
+            "mcp_get_tool_details",
+        ];
+        let big = "a".repeat(20_000);
+        for tool in tool_names {
+            // PTY/exec tools emit `output`; the rest emit `content`.
+            let field = if tool == tools::UNIFIED_EXEC {
+                "output"
+            } else {
+                "content"
+            };
+            let mut value = json!({});
+            value[field] = json!(big);
+            let result = registry.process_tool_output(tool, value.clone(), tool.starts_with("mcp")).await;
+
+            assert!(result.get("spool_path").is_some(), "tool {tool} should spool large output to a file path");
+            assert!(
+                result.get("spool_note").is_some(),
+                "tool {tool} should explain how to post-process the spooled file"
+            );
+            let inline = result
+                .get("content")
+                .or_else(|| result.get("output"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            assert!(inline.len() < big.len(), "tool {tool} should condense the preview, not inline the full blob");
+        }
+    }
+}

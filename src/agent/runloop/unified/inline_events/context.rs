@@ -1,0 +1,256 @@
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+use vtcode_core::config::loader::VTCodeConfig;
+use vtcode_core::config::types::AgentConfig as CoreAgentConfig;
+use vtcode_core::hooks::LifecycleHookEngine;
+use vtcode_core::llm::provider::{self as uni};
+use vtcode_core::utils::ansi::{AnsiRenderer, MessageStyle};
+use vtcode_ui::tui::app::{
+    InlineEvent, InlineHandle, InlineHeaderContext, TransientEvent, TransientHotkeyAction, TransientSelectionChange,
+    TransientSubmission,
+};
+
+use crate::agent::runloop::model_picker::ModelPickerState;
+use crate::agent::runloop::unified::context_manager::ContextManager;
+use crate::agent::runloop::unified::inline_events::harness::HarnessEventEmitter;
+use crate::agent::runloop::unified::model_selection::ModelSwitchCompactionTargets;
+use crate::agent::runloop::unified::palettes::ActivePalette;
+use crate::agent::runloop::unified::state::SessionStats;
+use crate::agent::runloop::welcome::SessionBootstrap;
+
+use super::action::InlineLoopAction;
+use super::control::InlineControlProcessor;
+use super::input::InlineInputProcessor;
+use super::interrupts::InlineInterruptCoordinator;
+use super::modal::InlineModalProcessor;
+use super::queue::InlineQueueState;
+use super::state::InlineEventState;
+
+pub(crate) struct InlineEventContext<'a> {
+    state: InlineEventState<'a>,
+    modal: InlineModalProcessor<'a>,
+    ctrl_c_state: &'a Arc<crate::agent::runloop::unified::state::CtrlCState>,
+    ctrl_c_notify: &'a Arc<Notify>,
+}
+
+impl<'a> InlineEventContext<'a> {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        renderer: &'a mut AnsiRenderer,
+        handle: &'a InlineHandle,
+        interrupts: InlineInterruptCoordinator<'a>,
+        ctrl_c_notice_displayed: &'a mut bool,
+        header_context: &'a mut InlineHeaderContext,
+        model_picker_state: &'a mut Option<ModelPickerState>,
+        palette_state: &'a mut Option<ActivePalette>,
+        config: &'a mut CoreAgentConfig,
+        vt_cfg: &'a mut Option<VTCodeConfig>,
+        provider_client: &'a mut Box<dyn uni::LLMProvider>,
+        ctrl_c_state: &'a Arc<crate::agent::runloop::unified::state::CtrlCState>,
+        ctrl_c_notify: &'a Arc<Notify>,
+        session_bootstrap: &'a SessionBootstrap,
+        full_auto: bool,
+        conversation_history: &'a mut Vec<uni::Message>,
+        session_stats: &'a mut SessionStats,
+        context_manager: &'a mut ContextManager,
+        session_id: &'a str,
+        thread_id: &'a str,
+        lifecycle_hooks: Option<&'a LifecycleHookEngine>,
+        harness_emitter: Option<&'a HarnessEventEmitter>,
+    ) -> Self {
+        let state = InlineEventState::new(renderer, interrupts, ctrl_c_notice_displayed);
+        let modal = InlineModalProcessor::new(
+            handle,
+            header_context,
+            model_picker_state,
+            palette_state,
+            config,
+            vt_cfg,
+            provider_client,
+            ctrl_c_state,
+            ctrl_c_notify,
+            session_bootstrap,
+            full_auto,
+            ModelSwitchCompactionTargets {
+                history: conversation_history,
+                session_stats,
+                context_manager,
+                session_id,
+                thread_id,
+                lifecycle_hooks,
+                harness_emitter,
+            },
+        );
+
+        Self { state, modal, ctrl_c_state, ctrl_c_notify }
+    }
+
+    pub(crate) async fn process_event(
+        &mut self,
+        event: InlineEvent,
+        queue: &mut InlineQueueState<'_>,
+    ) -> Result<InlineLoopAction> {
+        let action = match event {
+            InlineEvent::Submit(text) => self.input_processor().submit(text),
+            InlineEvent::QueueSubmit(text) => {
+                let primary_agent = self.modal.active_primary_agent_name();
+                self.input_processor().queue_submit(text, queue, primary_agent)
+            }
+            InlineEvent::ProcessLatestQueued => {
+                self.state.reset_interrupt_state();
+                queue.prefer_latest_next();
+                InlineLoopAction::Continue
+            }
+            InlineEvent::Steer(input) => {
+                if input.has_attachments() {
+                    self.state.reset_interrupt_state();
+                    self.state.renderer().line(
+                        MessageStyle::Warning,
+                        "Live steering supports text only. Remove image attachments before steering.",
+                    )?;
+                    self.modal.restore_input_draft(input);
+                    InlineLoopAction::Continue
+                } else {
+                    self.input_processor().passive()
+                }
+            }
+            InlineEvent::Pause | InlineEvent::Resume => {
+                self.state.reset_interrupt_state();
+                self.input_processor().passive()
+            }
+            InlineEvent::EditQueue => {
+                self.state.reset_interrupt_state();
+                queue.edit_latest();
+                InlineLoopAction::Continue
+            }
+            InlineEvent::Transient(overlay_event) => match overlay_event {
+                TransientEvent::SelectionChanged(TransientSelectionChange::List(selection)) => {
+                    self.modal.handle_preview(self.state.renderer(), selection)?
+                }
+                TransientEvent::SelectionChanged(TransientSelectionChange::DiffTrustMode { .. }) => {
+                    self.state.reset_interrupt_state();
+                    self.input_processor().passive()
+                }
+                TransientEvent::Submitted(TransientSubmission::Selection(selection)) => {
+                    self.state.reset_interrupt_state();
+                    self.modal.handle_submit(self.state.renderer(), selection).await?
+                }
+                TransientEvent::Submitted(TransientSubmission::Wizard(_)) => {
+                    self.state.reset_interrupt_state();
+                    self.input_processor().passive()
+                }
+                TransientEvent::Submitted(TransientSubmission::DiffApply) => {
+                    self.state.reset_interrupt_state();
+                    InlineLoopAction::DiffApproved
+                }
+                TransientEvent::Submitted(TransientSubmission::DiffReject) => {
+                    self.state.reset_interrupt_state();
+                    InlineLoopAction::DiffRejected
+                }
+                TransientEvent::Submitted(
+                    TransientSubmission::DiffProceed | TransientSubmission::DiffReload | TransientSubmission::DiffAbort,
+                ) => {
+                    self.state.reset_interrupt_state();
+                    self.input_processor().passive()
+                }
+                TransientEvent::Submitted(TransientSubmission::Hotkey(action)) => {
+                    self.state.reset_interrupt_state();
+                    match action {
+                        TransientHotkeyAction::LaunchEditor => self.input_processor().submit("/edit".into()),
+                        TransientHotkeyAction::ReloadSubagentInspector
+                        | TransientHotkeyAction::GracefulStopSubagent
+                        | TransientHotkeyAction::ForceCancelSubagent
+                        | TransientHotkeyAction::OpenSourceThread
+                        | TransientHotkeyAction::FocusJobOutput
+                        | TransientHotkeyAction::InterruptJob
+                        | TransientHotkeyAction::PreviewJobSnapshot => self.input_processor().passive(),
+                    }
+                }
+                TransientEvent::Cancelled => {
+                    self.state.reset_interrupt_state();
+                    self.modal.handle_cancel(self.state.renderer())?
+                }
+            },
+            InlineEvent::Cancel => self.control_processor().cancel()?,
+            InlineEvent::ForceCancelPtySession => self.control_processor().force_cancel_pty_session()?,
+            InlineEvent::Exit => self.control_processor().exit()?,
+            InlineEvent::Interrupt => self.handle_interrupt(),
+            InlineEvent::BackgroundOperation => self.input_processor().submit("/subprocesses toggle".into()),
+            InlineEvent::LaunchEditor { draft } => {
+                if draft.is_empty() {
+                    self.input_processor().submit("/edit".into())
+                } else {
+                    InlineLoopAction::LaunchEditorWithDraft { draft }
+                }
+            }
+            InlineEvent::RequestInlinePromptSuggestion(draft) => {
+                self.state.reset_interrupt_state();
+                InlineLoopAction::RequestInlinePromptSuggestion(draft)
+            }
+            InlineEvent::CyclePrimaryAgent => {
+                self.state.reset_interrupt_state();
+                InlineLoopAction::CyclePrimaryAgent
+            }
+            InlineEvent::CyclePrimaryAgentPrevious => {
+                self.state.reset_interrupt_state();
+                InlineLoopAction::CyclePrimaryAgentPrevious
+            }
+            InlineEvent::SelectPrimaryAgent { name } => {
+                self.state.reset_interrupt_state();
+                InlineLoopAction::SelectPrimaryAgent { name }
+            }
+            InlineEvent::OpenTranscriptReviewInEditor(text) => {
+                self.state.reset_interrupt_state();
+                InlineLoopAction::OpenTranscriptReviewInEditor(text)
+            }
+            InlineEvent::OpenTranscriptReviewScrollback(text) => {
+                self.state.reset_interrupt_state();
+                InlineLoopAction::OpenTranscriptReviewScrollback(text)
+            }
+            InlineEvent::OpenFileInEditor(path) => self.input_processor().submit(format!("/edit {path}").into()),
+            InlineEvent::OpenUrl(url) => {
+                self.state.reset_interrupt_state();
+                self.modal.request_url_guard(self.state.renderer(), url)?
+            }
+
+            InlineEvent::ScrollLineUp
+            | InlineEvent::ScrollLineDown
+            | InlineEvent::ScrollPageUp
+            | InlineEvent::ScrollPageDown
+            | InlineEvent::FileSelected(_)
+            | InlineEvent::HistoryPrevious
+            | InlineEvent::HistoryNext => self.input_processor().passive(),
+        };
+
+        Ok(action)
+    }
+
+    fn handle_interrupt(&mut self) -> InlineLoopAction {
+        let _ = self.modal.handle_cancel(self.state.renderer());
+        // Esc / Ctrl+C from the TUI.  In raw mode crossterm clears ISIG so
+        // Ctrl+C is a key event, not SIGINT -- the OS signal handler never
+        // fires.  We must call `request_local_stop()` so the turn loop
+        // detects the interruption.
+        //
+        // Single Ctrl+C -> CancelRequested -> cancel the current turn.
+        // Double Ctrl+C -> ExitRequested  -> exit the program.
+        //
+        // `register_signal()` applies a 200ms debounce so an accidental
+        // double-tap cannot escalate past CancelRequested.
+        crate::agent::runloop::unified::stop_requests::request_local_stop(self.ctrl_c_state, self.ctrl_c_notify);
+        if self.ctrl_c_state.is_exit_requested() {
+            return InlineLoopAction::Exit(vtcode_core::hooks::SessionEndReason::Exit);
+        }
+        InlineLoopAction::Continue
+    }
+
+    fn input_processor(&mut self) -> InlineInputProcessor<'_, 'a> {
+        InlineInputProcessor::new(&mut self.state)
+    }
+
+    fn control_processor(&mut self) -> InlineControlProcessor<'_, 'a> {
+        InlineControlProcessor::new(&mut self.state)
+    }
+}

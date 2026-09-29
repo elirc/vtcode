@@ -1,0 +1,1118 @@
+//! Agent Legibility:
+//! - Entrypoint: `run_turn_loop` coordinates the per-turn request, recovery, tool execution, and completion flow.
+//! - Common changes:
+//!   - Main loop policy and break/continue rules stay in this root.
+//!   - Post-tool recovery, usage accounting, and completion notification helpers live in `turn_loop/` support modules.
+//! - Constraints: Preserve turn-phase transitions and recovery semantics when moving helpers out of the root.
+//! - Verify: `cargo check -p vtcode && cargo test -p vtcode --bin vtcode turn_loop`
+
+use anyhow::Result;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+
+use crate::agent::runloop::unified::inline_events::harness::HarnessEventEmitter;
+use crate::agent::runloop::unified::inline_events::harness::{
+    turn_completed_event, turn_failed_event, turn_started_event,
+};
+use crate::agent::runloop::unified::planning_workflow_state::PlanningWorkflowSessionState;
+use crate::agent::runloop::unified::run_loop_context::HarnessTurnState;
+use crate::agent::runloop::unified::run_loop_context::RunLoopContext;
+use crate::agent::runloop::unified::run_loop_context::TurnPhase;
+use crate::agent::runloop::unified::tool_call_safety::ToolCallSafetyValidator;
+use crate::agent::runloop::unified::turn::context::TurnLoopResult;
+use crate::agent::runloop::unified::turn::turn_loop_helpers::{
+    ToolLoopLimitAction, extract_turn_config, handle_steering_messages, maybe_handle_planning_enter_trigger,
+    maybe_handle_planning_exit_trigger, maybe_handle_tool_loop_limit, resolve_safety_tool_call_limits,
+};
+use vtcode_core::acp::ToolPermissionCache;
+use vtcode_core::config::loader::VTCodeConfig;
+use vtcode_core::core::agent::runtime::RuntimeSteering;
+use vtcode_core::core::decision_tracker::DecisionTracker;
+use vtcode_core::core::trajectory::TrajectoryLogger;
+use vtcode_core::exec::events::Usage as HarnessUsage;
+use vtcode_core::hooks::LifecycleHookEngine;
+use vtcode_core::llm::provider as uni;
+use vtcode_core::tools::ToolResultCache;
+use vtcode_core::tools::{ApprovalRecorder, ToolRegistry};
+use vtcode_core::utils::ansi::{AnsiRenderer, MessageStyle};
+use vtcode_ui::tui::app::{InlineHandle, InlineSession};
+
+#[path = "turn_loop/notifications.rs"]
+mod notifications;
+#[path = "turn_loop/post_tool_recovery.rs"]
+mod post_tool_recovery;
+#[path = "turn_loop/usage_accounting.rs"]
+mod usage_accounting;
+
+// Using `tool_output_handler::handle_pipeline_output_from_turn_ctx` adapter where needed
+
+use crate::agent::runloop::mcp_events;
+use crate::agent::runloop::unified::turn::tool_outcomes::helpers::LoopTracker;
+use crate::agent::runloop::unified::turn::turn_helpers::{display_error, error_message_for_user};
+use notifications::emit_turn_outcome_notification;
+#[cfg(test)]
+use post_tool_recovery::PostToolFailureRecovery;
+#[cfg(test)]
+use post_tool_recovery::maybe_recover_after_post_tool_llm_failure;
+use post_tool_recovery::{
+    PostToolFailureAction, PostToolRecoveryContext, dispatch_post_tool_failure,
+    normalize_tool_free_recovery_break_outcome,
+};
+use usage_accounting::{accumulate_turn_usage, estimate_session_costs, has_turn_usage, stop_reason_from_finish_reason};
+use vtcode_core::config::types::AgentConfig;
+use vtcode_core::core::agent::error_recovery::ErrorType;
+use vtcode_core::primary_agent::ActivePrimaryAgentState;
+
+/// Max completion tokens for the tool-free recovery synthesis pass.
+///
+/// Raised from 1024 → 4096: recovery synthesis must summarize the entire
+/// turn's tool outputs (often dozens of file reads and searches). 1024 tokens
+/// truncated substantive answers — observed in checkpoint turn_621 where a
+/// launch-time analysis over ~60 messages could not fit and the pass
+/// destabilized into emitting tool-call markup instead of prose.
+const RECOVERY_SYNTHESIS_MAX_TOKENS: u32 = 4096;
+/// Maximum number of times the recovery pass is retried when the model
+/// returns tool calls (discarded) instead of text during tool-free recovery.
+///
+/// Raised from 2 → 3: a single transient post-tool follow-up failure (e.g. an
+/// LLM stream timeout on a large context) no longer terminates the turn and
+/// forces the user to nudge "continue". The extra pass only fires when the
+/// model keeps emitting tool calls during a tool-free recovery window.
+const MAX_RECOVERY_RETRIES: u8 = 3;
+/// Hard cap on how many assistant text responses the model may emit in a
+/// single turn.  Without this, the recovery / continuation logic can loop
+/// forever when the model has already produced a substantive final answer
+/// but the system keeps re-prompting it (e.g. tool-free recovery activates
+/// on a transient LLM stream timeout, the model re-summarizes the same
+/// outline 4+ times, wasting context and tokens).
+///
+/// Observed in checkpoint turn_594: a simple "what functions/structs are
+/// defined in crates/codegen/vtcode-core/src/tools/registry?" task produced 4 identical
+/// 6500-token outline responses and burned ~90 seconds.  Capping at 2
+/// responses terminates the runaway loop while still allowing one retry
+/// for genuine recovery scenarios.
+const MAX_ASSISTANT_TEXT_RESPONSES_PER_TURN: u32 = 2;
+/// Maximum number of times the post-tool follow-up failure path may schedule
+/// a tool-free recovery pass within a single turn. This is a defense-in-depth
+/// backstop: the recovery pass itself is terminal (a text response ends the
+/// turn), so under normal operation this cap never trips. It only fires if a
+/// future regression re-enables tools after recovery or otherwise re-triggers
+/// the post-tool failure path cyclically.
+const MAX_POST_TOOL_RECOVERY_CYCLES: u8 = 2;
+pub(crate) const POST_TOOL_RECOVERY_REASON: &str =
+    "Tool follow-up failed. Tools disabled; respond with text using context and recent tool outputs.";
+const RECOVERY_SYNTHESIS_FALLBACK_FINAL_ANSWER: &str = "Recovery synthesis failed; no tool call applied. The tool outputs gathered above contain the information needed. Re-state your request and the next turn will reuse the gathered context from this conversation history.";
+/// Plan-mode variant of [`RECOVERY_SYNTHESIS_FALLBACK_FINAL_ANSWER`]. In plan
+/// mode the turn must not dead-end: planning research is preserved and the
+/// interview is re-forced on the next turn (the planning session state is left
+/// `interview_pending`), so this message tells the user to continue planning
+/// rather than re-state a generic request.
+const PLANNING_RECOVERY_SYNTHESIS_FALLBACK: &str = "Planning research completed, but the final synthesis failed (transient provider error). Your gathered context is preserved and the planning interview will be presented on the next turn — re-state your request or press Enter to continue planning.";
+/// Variant of [`PLANNING_RECOVERY_SYNTHESIS_FALLBACK`] used once
+/// `request_user_input` has been permanently denied by policy this session
+/// (`PlanningWorkflowSessionState::is_interview_denied`). The transient-error
+/// variant above falsely promises "the planning interview will be presented
+/// on the next turn" — a denial recurs on every attempt, so no interview will
+/// ever be shown again. This tells the user the plan will be finalized from
+/// gathered research instead (checkpoint turn_655/turn_660).
+const PLANNING_RECOVERY_SYNTHESIS_FALLBACK_NO_INTERVIEW: &str = "Planning research completed, but the final synthesis failed (transient provider error). Interactive questions are unavailable in this runtime, so the plan will be finalized from the research already gathered — re-state your request or type `implement` / `keep planning` to continue.";
+/// Plan-mode fallback when the session budget is exhausted. Unlike the
+/// transient-error variant, this tells the agent to finalize the plan NOW
+/// from the evidence already gathered — the budget is spent and no further
+/// LLM calls are possible this session.
+const PLANNING_BUDGET_EXHAUSTED_FINALIZE: &str = "Budget exhausted. Finalize the plan NOW from the evidence already gathered in this conversation. Do NOT attempt any more tool calls or LLM requests — synthesize your final answer immediately.";
+/// User-facing final answer for the budget-exhausted plan-mode dead end. The
+/// `*_FINALIZE` constant above is a directive addressed to the MODEL (injected
+/// as system messages before a synthesis pass); they must never be shown as the
+/// user-visible final answer — no LLM call follows them in the recovery path,
+/// so the user would see a bare instruction and the turn would silently stop
+/// (observed in checkpoint turn_655). These notices tell the USER how to
+/// continue: the plan draft and research live in the session plan file, and the
+/// planning session stays alive so `implement` / `keep planning` still work.
+const PLANNING_BUDGET_EXHAUSTED_USER_NOTICE: &str = "Budget exhausted before the plan synthesis could complete. The research gathered and the current plan draft are preserved in the session plan file (.vtcode/plans/).";
+/// User-facing final answer for the recovery-exhausted plan-mode dead end.
+/// See [`PLANNING_BUDGET_EXHAUSTED_USER_NOTICE`].
+const PLANNING_RECOVERY_EXHAUSTED_USER_NOTICE: &str = "Plan synthesis failed after repeated recovery attempts (provider errors or saturated context). The research gathered and the current plan draft are preserved in the session plan file (.vtcode/plans/).";
+/// Reason set on `TurnLoopResult::Blocked` when the model emits tool calls or
+/// textual tool-call markup during a tool-free recovery pass.  Shared between
+/// `result_handler` (producer) and `post_tool_recovery` (consumer).
+pub(super) const RECOVERY_CONTRACT_VIOLATION_REASON: &str =
+    "Recovery mode requested a final tool-free synthesis pass, but the model attempted more tool calls.";
+/// System message injected before retrying a tool-free recovery pass when the model
+/// produced tool calls or textual tool-call markup (which are discarded) instead of
+/// plain text. It names the failure mode explicitly so the model can self-correct on
+/// the retry rather than repeating the same violation (observed in checkpoint turn_621,
+/// where a single `<tool_call>` block terminated the turn instead of being retried).
+const RECOVERY_TOOL_CALL_RETRY_DIRECTIVE: &str = "Recovery: tools are disabled, so respond with plain text only. Your previous \
+     attempt included tool-call or function-call markup; summarize the findings from \
+     the tool outputs already in history as a final answer, without any <tool_call>, \
+     <function=...>, or other tool-call syntax.";
+/// Plan-mode variant of [`POST_TOOL_RECOVERY_REASON`]. In plan mode the agent
+/// must emit the `<proposed_plan>` from the research already gathered, not start
+/// more research — so the recovery reason names the plan format explicitly.
+/// Without this, the model treats the tool-free recovery pass as another
+/// research step and emits `<invoke>`/`<tool_call>` markup instead of a plan
+/// (observed in checkpoints turn_648 and turn_650).
+const POST_TOOL_RECOVERY_REASON_PLAN_MODE: &str = "Planning research completed, but the final plan synthesis failed (transient provider error). Tools are disabled. Produce the `<proposed_plan>` NOW from the context and tool outputs already in this conversation: keep each step to a single line (`Action -> files/symbols -> verify:`), prefer file:symbol references, and do NOT emit any tool calls or tool-call markup.";
+/// Plan-mode variant of [`RECOVERY_TOOL_CALL_RETRY_DIRECTIVE`]. The generic
+/// directive only says \"respond with plain text\"; in plan mode the agent must
+/// instead finalize the `<proposed_plan>` from gathered research, otherwise it
+/// loops emitting `<invoke>` research calls during the tool-free recovery pass.
+const RECOVERY_TOOL_CALL_RETRY_DIRECTIVE_PLAN_MODE: &str = "Recovery: in plan mode, tools are disabled and you must finalize the plan. Emit ONLY the `<proposed_plan>` now from the research already gathered in this conversation — each step on a single line (`Action -> files/symbols -> verify:`), no prose, no tool calls, and no `<tool_call>`/`<invoke>`/`<function=...>` markup.";
+
+/// Count how many assistant text responses the model has emitted in this
+/// turn so far.  Used by the anti-runaway guard to short-circuit when the
+/// recovery / continuation loop regenerates the same answer repeatedly.
+///
+/// Counts messages appended after `turn_history_start_len` with
+/// `role == Assistant`, no `tool_calls`, and a non-empty trimmed text body.
+/// System-recovery messages are ignored.
+fn count_assistant_text_responses_in_turn(history: &[uni::Message], turn_history_start_len: usize) -> u32 {
+    history
+        .get(turn_history_start_len..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|message| {
+            message.role == uni::MessageRole::Assistant
+                && message.tool_calls.is_none()
+                && !message.content.as_text().trim().is_empty()
+        })
+        .count() as u32
+}
+
+/// Count assistant text responses for the anti-runaway guard.
+///
+/// The history slice excludes assistant replies from earlier turns and, after
+/// compaction rebases `turn_history_start_len`, promptly counts new assistant
+/// text appended after compaction. The per-turn counter is a compaction-safe
+/// floor for assistant text already emitted earlier in this turn.
+fn count_assistant_text_responses_for_guard(
+    history: &[uni::Message],
+    turn_history_start_len: usize,
+    recorded_text_responses_in_turn: u32,
+) -> u32 {
+    count_assistant_text_responses_in_turn(history, turn_history_start_len).max(recorded_text_responses_in_turn)
+}
+
+pub(crate) struct TurnLoopOutcome {
+    pub result: TurnLoopResult,
+    pub turn_modified_files: BTreeSet<PathBuf>,
+    /// When set, the interaction loop should switch the active primary agent
+    /// to this name after the turn completes.
+    pub pending_primary_agent: Option<String>,
+}
+
+pub(crate) struct TurnLoopContext<'a> {
+    pub renderer: &'a mut AnsiRenderer,
+    pub handle: &'a InlineHandle,
+    pub session: &'a mut InlineSession,
+    pub session_stats: &'a mut crate::agent::runloop::unified::state::SessionStats,
+    pub plan_session: &'a mut PlanningWorkflowSessionState,
+    pub auto_finish_planning_attempted: &'a mut bool,
+    pub mcp_panel_state: &'a mut mcp_events::McpPanelState,
+    pub tool_result_cache: &'a Arc<RwLock<ToolResultCache>>,
+    pub approval_recorder: &'a Arc<ApprovalRecorder>,
+    pub decision_ledger: &'a Arc<RwLock<DecisionTracker>>,
+    pub tool_registry: &'a mut ToolRegistry,
+    pub tools: &'a Arc<RwLock<Vec<uni::ToolDefinition>>>,
+    pub tool_catalog: &'a Arc<crate::agent::runloop::unified::tool_catalog::ToolCatalogState>,
+    pub ctrl_c_state: &'a Arc<crate::agent::runloop::unified::state::CtrlCState>,
+    pub ctrl_c_notify: &'a Arc<tokio::sync::Notify>,
+    pub context_manager: &'a mut crate::agent::runloop::unified::context_manager::ContextManager,
+    pub last_forced_redraw: &'a mut Instant,
+    pub input_status_state: &'a mut crate::agent::runloop::unified::status_line::InputStatusState,
+    pub lifecycle_hooks: Option<&'a LifecycleHookEngine>,
+    pub default_placeholder: &'a Option<String>,
+    pub tool_permission_cache: &'a Arc<RwLock<ToolPermissionCache>>,
+    pub permissions_state: &'a Arc<RwLock<vtcode_core::config::PermissionsConfig>>,
+    pub safety_validator: &'a Arc<ToolCallSafetyValidator>,
+    pub circuit_breaker: &'a Arc<vtcode_core::tools::circuit_breaker::CircuitBreaker>,
+    pub tool_health_tracker: &'a Arc<vtcode_core::tools::health::ToolHealthTracker>,
+    pub rate_limiter: &'a Arc<vtcode_core::tools::adaptive_rate_limiter::AdaptiveRateLimiter>,
+    pub telemetry: &'a Arc<vtcode_core::core::telemetry::TelemetryManager>,
+    pub autonomous_executor: &'a Arc<vtcode_core::tools::autonomous_executor::AutonomousExecutor>,
+    pub error_recovery: &'a Arc<RwLock<vtcode_core::core::agent::error_recovery::ErrorRecoveryState>>,
+    pub harness_state: &'a mut HarnessTurnState,
+    pub harness_emitter: Option<&'a HarnessEventEmitter>,
+    pub config: &'a mut AgentConfig,
+    pub vt_cfg: Option<&'a VTCodeConfig>,
+    pub turn_metadata_cache: &'a mut Option<Option<serde_json::Value>>,
+    pub provider_client: &'a mut Box<dyn uni::LLMProvider>,
+    pub traj: &'a TrajectoryLogger,
+    pub active_primary_agent: &'a ActivePrimaryAgentState,
+    pub skip_confirmations: bool,
+    pub full_auto: bool,
+    pub runtime_steering: &'a mut RuntimeSteering,
+}
+
+impl<'a> TurnLoopContext<'a> {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        renderer: &'a mut AnsiRenderer,
+        handle: &'a InlineHandle,
+        session: &'a mut InlineSession,
+        session_stats: &'a mut crate::agent::runloop::unified::state::SessionStats,
+        plan_session: &'a mut PlanningWorkflowSessionState,
+        auto_finish_planning_attempted: &'a mut bool,
+        mcp_panel_state: &'a mut mcp_events::McpPanelState,
+        tool_result_cache: &'a Arc<RwLock<ToolResultCache>>,
+        approval_recorder: &'a Arc<ApprovalRecorder>,
+        decision_ledger: &'a Arc<RwLock<DecisionTracker>>,
+        tool_registry: &'a mut ToolRegistry,
+        tools: &'a Arc<RwLock<Vec<uni::ToolDefinition>>>,
+        tool_catalog: &'a Arc<crate::agent::runloop::unified::tool_catalog::ToolCatalogState>,
+        ctrl_c_state: &'a Arc<crate::agent::runloop::unified::state::CtrlCState>,
+        ctrl_c_notify: &'a Arc<tokio::sync::Notify>,
+        context_manager: &'a mut crate::agent::runloop::unified::context_manager::ContextManager,
+        last_forced_redraw: &'a mut Instant,
+        input_status_state: &'a mut crate::agent::runloop::unified::status_line::InputStatusState,
+        lifecycle_hooks: Option<&'a LifecycleHookEngine>,
+        default_placeholder: &'a Option<String>,
+        tool_permission_cache: &'a Arc<RwLock<ToolPermissionCache>>,
+        permissions_state: &'a Arc<RwLock<vtcode_core::config::PermissionsConfig>>,
+        safety_validator: &'a Arc<ToolCallSafetyValidator>,
+        circuit_breaker: &'a Arc<vtcode_core::tools::circuit_breaker::CircuitBreaker>,
+        tool_health_tracker: &'a Arc<vtcode_core::tools::health::ToolHealthTracker>,
+        rate_limiter: &'a Arc<vtcode_core::tools::adaptive_rate_limiter::AdaptiveRateLimiter>,
+        telemetry: &'a Arc<vtcode_core::core::telemetry::TelemetryManager>,
+        autonomous_executor: &'a Arc<vtcode_core::tools::autonomous_executor::AutonomousExecutor>,
+        error_recovery: &'a Arc<RwLock<vtcode_core::core::agent::error_recovery::ErrorRecoveryState>>,
+        harness_state: &'a mut HarnessTurnState,
+        harness_emitter: Option<&'a HarnessEventEmitter>,
+        config: &'a mut AgentConfig,
+        vt_cfg: Option<&'a VTCodeConfig>,
+        turn_metadata_cache: &'a mut Option<Option<serde_json::Value>>,
+        provider_client: &'a mut Box<dyn uni::LLMProvider>,
+        traj: &'a TrajectoryLogger,
+        active_primary_agent: &'a ActivePrimaryAgentState,
+        skip_confirmations: bool,
+        full_auto: bool,
+        runtime_steering: &'a mut RuntimeSteering,
+    ) -> Self {
+        Self {
+            renderer,
+            handle,
+            session,
+            session_stats,
+            plan_session,
+            auto_finish_planning_attempted,
+            mcp_panel_state,
+            tool_result_cache,
+            approval_recorder,
+            decision_ledger,
+            tool_registry,
+            tools,
+            tool_catalog,
+            ctrl_c_state,
+            ctrl_c_notify,
+            context_manager,
+            last_forced_redraw,
+            input_status_state,
+            lifecycle_hooks,
+            default_placeholder,
+            tool_permission_cache,
+            permissions_state,
+            safety_validator,
+            circuit_breaker,
+            tool_health_tracker,
+            rate_limiter,
+            telemetry,
+            autonomous_executor,
+            error_recovery,
+            harness_state,
+            harness_emitter,
+            config,
+            vt_cfg,
+            turn_metadata_cache,
+            provider_client,
+            traj,
+            active_primary_agent,
+            skip_confirmations,
+            full_auto,
+            runtime_steering,
+        }
+    }
+
+    pub(crate) fn as_run_loop_context(&mut self) -> RunLoopContext<'_> {
+        let auto_permission = Some(crate::agent::runloop::unified::run_loop_context::AutoPermissionRuntimeContext {
+            config: self.config,
+            vt_cfg: self.vt_cfg,
+            provider_client: self.provider_client.as_mut(),
+            working_history: &[],
+        });
+
+        let mut ctx = RunLoopContext::new_with_auto_permission_context(
+            self.renderer,
+            self.handle,
+            self.tool_registry,
+            self.tools,
+            self.tool_result_cache,
+            self.tool_permission_cache,
+            self.permissions_state,
+            self.decision_ledger,
+            self.session_stats,
+            self.plan_session,
+            self.mcp_panel_state,
+            self.approval_recorder,
+            self.session,
+            Some(self.safety_validator),
+            self.traj,
+            self.harness_state,
+            self.harness_emitter,
+            auto_permission,
+        );
+        ctx.active_agent_permissions = self
+            .vt_cfg
+            .and_then(|cfg| cfg.runtime_agent_permissions.as_ref())
+            .or(Some(&self.active_primary_agent.active().permissions));
+        ctx.agent_name = Some(self.active_primary_agent.active().identity.name.clone());
+        // The primary agent loop is always for the primary agent, not a subagent
+        ctx.is_subagent = false;
+        ctx
+    }
+
+    pub(crate) fn as_turn_processing_context<'b>(
+        &'b mut self,
+        working_history: &'b mut Vec<uni::Message>,
+    ) -> crate::agent::runloop::unified::turn::context::TurnProcessingContext<'b> {
+        let tool = crate::agent::runloop::unified::turn::context::ToolContext {
+            tool_result_cache: self.tool_result_cache,
+            approval_recorder: self.approval_recorder,
+            tool_registry: self.tool_registry,
+            tools: self.tools,
+            tool_catalog: self.tool_catalog,
+            tool_permission_cache: self.tool_permission_cache,
+            permissions_state: self.permissions_state,
+            safety_validator: self.safety_validator,
+            circuit_breaker: self.circuit_breaker,
+            tool_health_tracker: self.tool_health_tracker,
+            rate_limiter: self.rate_limiter,
+            telemetry: self.telemetry,
+            autonomous_executor: self.autonomous_executor,
+            error_recovery: self.error_recovery,
+        };
+        let llm = crate::agent::runloop::unified::turn::context::LLMContext {
+            provider_client: self.provider_client,
+            config: self.config,
+            vt_cfg: self.vt_cfg,
+            context_manager: self.context_manager,
+            active_primary_agent: self.active_primary_agent,
+            decision_ledger: self.decision_ledger,
+            traj: self.traj,
+        };
+        let ui = crate::agent::runloop::unified::turn::context::UIContext {
+            renderer: self.renderer,
+            handle: self.handle,
+            session: self.session,
+            active_thread_label: "main",
+            ctrl_c_state: self.ctrl_c_state,
+            ctrl_c_notify: self.ctrl_c_notify,
+            lifecycle_hooks: self.lifecycle_hooks,
+            default_placeholder: self.default_placeholder,
+            last_forced_redraw: self.last_forced_redraw,
+            input_status_state: self.input_status_state,
+        };
+        let state = crate::agent::runloop::unified::turn::context::TurnProcessingState {
+            session_stats: self.session_stats,
+            plan_session: self.plan_session,
+            auto_finish_planning_attempted: self.auto_finish_planning_attempted,
+            mcp_panel_state: self.mcp_panel_state,
+            working_history,
+            turn_metadata_cache: self.turn_metadata_cache,
+            skip_confirmations: self.skip_confirmations,
+            full_auto: self.full_auto,
+            harness_state: self.harness_state,
+            harness_emitter: self.harness_emitter,
+            runtime_steering: self.runtime_steering,
+        };
+
+        crate::agent::runloop::unified::turn::context::TurnProcessingContext::from_parts(
+            crate::agent::runloop::unified::turn::context::TurnProcessingContextParts { tool, llm, ui, state },
+        )
+    }
+
+    pub(crate) fn is_planning_active(&self) -> bool {
+        self.tool_registry.is_planning_active()
+    }
+
+    pub(crate) fn set_phase(&mut self, phase: TurnPhase) {
+        self.harness_state.set_phase(phase);
+    }
+}
+
+pub(crate) const POST_TOOL_RESUME_DIRECTIVE: &str = "Previous turn already completed tool execution. Reuse the latest tool outputs in history instead of rerunning the same exploration. If those tool outputs include `critical_note`, `hint`, `next_action`, `fallback_tool`, `fallback_tool_args`, or `rerun_hint`, follow that guidance first. Do NOT re-read files that were already read in the previous turn — their content is in the conversation history above. Synthesize a plan or answer from what is already gathered.";
+
+// For `TurnLoopContext`, we will reuse the generic `handle_pipeline_output` via an adapter below.
+
+pub(crate) async fn run_turn_loop(
+    working_history: &mut Vec<uni::Message>,
+    mut ctx: TurnLoopContext<'_>,
+) -> Result<TurnLoopOutcome> {
+    use crate::agent::runloop::unified::turn::context::{TurnHandlerOutcome, TurnProcessingResult};
+    use crate::agent::runloop::unified::turn::guards::run_proactive_guards;
+    use crate::agent::runloop::unified::turn::turn_processing::{
+        HandleTurnProcessingResultParams, execute_llm_request, handle_turn_processing_result,
+        maybe_force_planning_workflow_interview, process_llm_response,
+    };
+
+    // Initialize the outcome result
+    let mut result = TurnLoopResult::Completed;
+    let mut turn_modified_files = BTreeSet::new();
+    let mut pending_primary_agent: Option<String> = None;
+    *ctx.auto_finish_planning_attempted = false;
+
+    ctx.set_phase(TurnPhase::Preparing);
+    if let Some(Err(e)) = ctx.harness_emitter.map(|e| e.emit(turn_started_event())) {
+        tracing::debug!(error = %e, "harness turn_started event emission failed");
+    }
+
+    // Optimization: Extract all frequently accessed config values once
+    let turn_config = extract_turn_config(ctx.vt_cfg, ctx.is_planning_active(), ctx.renderer.supports_inline_ui());
+
+    let mut step_count = 0;
+    let mut current_max_tool_loops = turn_config.max_tool_loops;
+    let mut turn_history_start_len = working_history.len();
+    // Bounded condense-retry counter for truncated planning syntheses (see
+    // the re-prompt block after generation). Prevents an oversized plan from
+    // looping the turn.
+    let mut plan_condense_attempts: u8 = 0;
+    let mut turn_usage = HarnessUsage::default();
+    // Optimization: Interned signatures with exponential backoff for loop detection
+    let mut repeated_tool_attempts = LoopTracker::new();
+
+    // Reset safety validator for a new turn
+    {
+        let (max_per_turn, max_per_session) = resolve_safety_tool_call_limits(
+            ctx.harness_state.max_tool_calls,
+            turn_config.max_session_turns,
+            ctx.is_planning_active(),
+        );
+        ctx.safety_validator.set_limits(max_per_turn, max_per_session);
+        ctx.safety_validator.start_turn();
+    }
+
+    loop {
+        if handle_steering_messages(&mut ctx, working_history, &mut result).await? {
+            break;
+        }
+
+        step_count += 1;
+        ctx.telemetry.record_turn();
+
+        if maybe_handle_planning_enter_trigger(&mut ctx, working_history, step_count, &mut result).await? {
+            break;
+        }
+
+        if maybe_handle_planning_exit_trigger(&mut ctx, working_history, step_count, &mut pending_primary_agent).await?
+        {
+            break;
+        }
+
+        match maybe_handle_tool_loop_limit(&mut ctx, step_count, &mut current_max_tool_loops).await? {
+            ToolLoopLimitAction::Proceed => {}
+            ToolLoopLimitAction::ContinueLoop => continue,
+            ToolLoopLimitAction::BreakLoop => break,
+        }
+
+        let active_model = ctx.config.model.clone();
+        let harness_snapshot = ctx.tool_registry.harness_context_snapshot();
+        match crate::agent::runloop::unified::turn::compaction::maybe_auto_compact_history(
+            crate::agent::runloop::unified::turn::compaction::CompactionContext::new(
+                ctx.provider_client.as_ref(),
+                &active_model,
+                &harness_snapshot.session_id,
+                &ctx.harness_state.run_id.0,
+                &ctx.config.workspace,
+                ctx.vt_cfg,
+                ctx.lifecycle_hooks,
+                ctx.harness_emitter,
+            ),
+            crate::agent::runloop::unified::turn::compaction::CompactionState::new(
+                working_history,
+                ctx.session_stats,
+                ctx.context_manager,
+            ),
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                turn_history_start_len = outcome.compacted_len;
+                tracing::info!(
+                    original_len = outcome.original_len,
+                    compacted_len = outcome.compacted_len,
+                    turn_history_start_len,
+                    "Applied local fallback compaction before the next turn request"
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "Local fallback compaction failed");
+            }
+        }
+
+        // Clone validation cache arc to avoid borrow conflict
+        let validation_cache = ctx.session_stats.validation_cache.clone();
+
+        // Capture input status state for potential restoration after LLM response
+        // (needed because turn_processing_ctx will mutably borrow input_status_state)
+        let restore_status_left = ctx.input_status_state.left.clone();
+        let restore_status_right = ctx.input_status_state.right.clone();
+
+        // Anti-runaway guard: if the model has already emitted
+        // MAX_ASSISTANT_TEXT_RESPONSES_PER_TURN text responses in this turn,
+        // the recovery / continuation loop is regenerating the same answer
+        // over and over.  Conclude the turn with the last response stored
+        // in working_history and emit a warning so users can see what
+        // happened.  See MAX_ASSISTANT_TEXT_RESPONSES_PER_TURN for the
+        // observed failure mode (checkpoint turn_594: 4 identical 6500-token
+        // outline responses, ~90s of wasted context).
+        let text_responses_so_far = count_assistant_text_responses_for_guard(
+            working_history,
+            turn_history_start_len,
+            ctx.harness_state.assistant_text_responses_in_turn,
+        );
+        if text_responses_so_far >= MAX_ASSISTANT_TEXT_RESPONSES_PER_TURN {
+            tracing::warn!(
+                text_responses = text_responses_so_far,
+                cap = MAX_ASSISTANT_TEXT_RESPONSES_PER_TURN,
+                "Assistant text-response cap reached; ending turn to prevent runaway regeneration loop"
+            );
+            let _ = ctx.renderer.line(
+                MessageStyle::Warning,
+                "Recovery loop detected: capping repeated assistant responses to avoid wasted context.",
+            );
+            result = TurnLoopResult::Completed;
+            break;
+        }
+
+        // Prepare turn processing context
+        let mut turn_processing_ctx = ctx.as_turn_processing_context(working_history);
+
+        // === PROACTIVE GUARDS (HP-2: Pre-request checks) ===
+        run_proactive_guards(&mut turn_processing_ctx, step_count).await?;
+
+        // Execute the LLM request
+        turn_processing_ctx.set_phase(TurnPhase::Requesting);
+        let active_model = turn_processing_ctx.config.model.clone();
+        let recovery_pass = turn_processing_ctx.consume_recovery_pass();
+
+        let tool_free_recovery = recovery_pass && turn_processing_ctx.recovery_is_tool_free();
+
+        // Cache-gap advisory (Phase E1): warn once per gap when the user
+        // paused long enough for the provider prompt cache to have expired,
+        // so this request may unexpectedly re-pay full input cost.
+        let cache_gap_provider_name = turn_processing_ctx.config.provider.clone();
+        if let Some(threshold) = turn_processing_ctx
+            .vt_cfg
+            .and_then(|cfg| cfg.prompt_cache.gap_threshold_secs(&cache_gap_provider_name))
+        {
+            let threshold = Duration::from_secs(threshold);
+            if turn_processing_ctx.session_stats.total_usage().cached_input_tokens > 0
+                && let Some(elapsed) = turn_processing_ctx.session_stats.cache_gap_exceeds(threshold)
+            {
+                let _ = turn_processing_ctx.renderer.line(
+                    MessageStyle::Info,
+                    &format!(
+                        "~{} since the last request; the provider prompt cache has likely expired, so this request may re-pay full input cost.",
+                        vtcode_core::llm::request_gap::format_gap(elapsed)
+                    ),
+                );
+            }
+        }
+        turn_processing_ctx.session_stats.note_request_sent();
+
+        let (response, response_streamed) = match execute_llm_request(
+            &mut turn_processing_ctx,
+            step_count,
+            &active_model,
+            tool_free_recovery.then_some(RECOVERY_SYNTHESIS_MAX_TOKENS),
+            tool_free_recovery,
+            None, // parallel_cfg_opt
+        )
+        .await
+        {
+            Ok(val) => val,
+            Err(err) => {
+                // Record the error in the recovery state for diagnostics
+                turn_processing_ctx
+                    .record_recovery_error("llm_request", &err, ErrorType::Other)
+                    .await;
+
+                // execute_llm_request already performs retry/backoff for retryable provider errors.
+                // Avoid a second retry layer here, which can consume turn budget and cause timeouts.
+                // Restore input status on request failure to clear loading/shimmer state.
+                turn_processing_ctx.restore_input_status(restore_status_left.clone(), restore_status_right.clone());
+
+                let planning = turn_processing_ctx.is_planning_active();
+                match dispatch_post_tool_failure(PostToolRecoveryContext {
+                    renderer: &mut *turn_processing_ctx.renderer,
+                    working_history: &mut *turn_processing_ctx.working_history,
+                    harness_state: &mut *turn_processing_ctx.harness_state,
+                    plan_session: planning.then_some(&mut *turn_processing_ctx.plan_session),
+                    plan_state: planning.then_some(&turn_processing_ctx.tool_registry.planning_workflow_state()),
+                    err: &err,
+                    step_count,
+                    turn_history_start_len,
+                    stage: "execute_llm_request",
+                    tool_free_recovery,
+                })
+                .await?
+                {
+                    PostToolFailureAction::Continue => continue,
+                    PostToolFailureAction::Break(r) => {
+                        result = r;
+                        break;
+                    }
+                    PostToolFailureAction::Fallthrough => {}
+                }
+
+                display_error(turn_processing_ctx.renderer, "LLM request failed", &err)?;
+                // Show recovery hints derived from the canonical error category
+                {
+                    let err_cat = vtcode_commons::classify_anyhow_error(&err);
+                    if matches!(err_cat, vtcode_commons::ErrorCategory::Authentication) {
+                        // For auth errors, show actionable provider-specific guidance
+                        let provider_label = turn_processing_ctx
+                            .config
+                            .provider
+                            .parse::<vtcode_core::config::models::Provider>()
+                            .map(|p| p.label().to_string())
+                            .unwrap_or_else(|_| turn_processing_ctx.config.provider.clone());
+                        let env_key = &turn_processing_ctx.config.api_key_env;
+                        let env_path = vtcode_config::workspace_env_path_display(&turn_processing_ctx.config.workspace);
+                        let guidance = err_cat.auth_recovery_guidance(&provider_label, env_key, Some(&env_path));
+                        for line in &guidance {
+                            turn_processing_ctx.renderer.line(MessageStyle::Info, line)?;
+                        }
+                    } else {
+                        let suggestions = err_cat.recovery_suggestions();
+                        if !suggestions.is_empty() {
+                            let hint = suggestions.join("; ");
+                            turn_processing_ctx
+                                .renderer
+                                .line(MessageStyle::Info, &format!("Hint: {hint}"))?;
+                        }
+                    }
+                }
+                // Log error via tracing instead of polluting conversation history
+                // Adding error messages as assistant content can poison future turns
+                let error_message = error_message_for_user(&err);
+                tracing::error!(error = %error_message, step = step_count, "LLM request failed");
+                // Do NOT add error message to working_history - this prevents the model
+                // from learning spurious error patterns and keeps the conversation clean
+                result = TurnLoopResult::Aborted;
+                break;
+            }
+        };
+
+        // Track turn usage and context pressure before later processing borrows `response`.
+        let response_usage = response.usage.clone();
+        let provider_name = turn_processing_ctx.config.provider.clone();
+        accumulate_turn_usage(&provider_name, &mut turn_usage, &response_usage);
+        turn_processing_ctx.session_stats.record_usage(&provider_name, &response_usage);
+        turn_processing_ctx
+            .session_stats
+            .set_stop_reason(Some(stop_reason_from_finish_reason(&response.finish_reason)));
+        let max_budget_usd = turn_processing_ctx.vt_cfg.and_then(|cfg| cfg.agent.harness.max_budget_usd);
+        let total_usage = turn_processing_ctx.session_stats.total_usage();
+        match estimate_session_costs(&provider_name, &active_model, &total_usage) {
+            Some(estimate) => {
+                turn_processing_ctx.session_stats.set_total_cost_usd(Some(estimate.raw_usd));
+                let threshold = turn_processing_ctx
+                    .vt_cfg
+                    .map(|cfg| cfg.agent.harness.budget_warning_threshold)
+                    .unwrap_or(vtcode_core::llm::usage_cost::DEFAULT_BUDGET_WARNING_RATIO);
+                match vtcode_core::llm::usage_cost::BudgetStatus::classify(estimate.raw_usd, max_budget_usd, threshold)
+                {
+                    vtcode_core::llm::usage_cost::BudgetStatus::Exceeded { max, .. } => {
+                        turn_processing_ctx
+                            .session_stats
+                            .mark_budget_limit_reached(max, estimate.raw_usd);
+                        turn_processing_ctx.context_manager.update_token_usage(&response_usage);
+                        #[cfg(debug_assertions)]
+                        turn_processing_ctx.context_manager.validate_token_tracking(&response_usage);
+                        // In planning mode, finalize the plan from gathered evidence
+                        // rather than returning Blocked (which would re-enter planning
+                        // on the next turn and loop forever).
+                        if turn_processing_ctx.is_planning_active() {
+                            turn_processing_ctx.plan_session.mark_budget_exhausted();
+                            // Deactivate planning workflow so mutating tools are
+                            // available on the next turn if the user continues.
+                            turn_processing_ctx.tool_registry.disable_planning();
+                            turn_processing_ctx.plan_session.exit();
+                            let finalize_msg = format!(
+                                "{PLANNING_BUDGET_EXHAUSTED_FINALIZE}\n\n\
+                                 Budget: ${:.4}, spent: ${:.4}.",
+                                max, estimate.raw_usd
+                            );
+                            turn_processing_ctx.working_history.push(uni::Message::system(finalize_msg));
+                            let _ = turn_processing_ctx.renderer.line(
+                                MessageStyle::Warning,
+                                "Budget exhausted during planning workflow. Finalizing plan from gathered evidence.",
+                            );
+                            result = TurnLoopResult::Completed;
+                        } else {
+                            result = TurnLoopResult::Blocked {
+                                reason: Some(format!(
+                                    "Stopped after reaching budget limit (max: ${max:.4}, spent: ${:.4}, cache-adjusted: ${:.4}).",
+                                    estimate.raw_usd, estimate.effective_usd
+                                )),
+                            };
+                        }
+                        break;
+                    }
+                    vtcode_core::llm::usage_cost::BudgetStatus::Warning { max, .. }
+                        if !turn_processing_ctx.session_stats.budget_warning_emitted() =>
+                    {
+                        turn_processing_ctx.session_stats.mark_budget_warning_emitted();
+                        let _ = turn_processing_ctx.renderer.line(
+                            MessageStyle::Info,
+                            &format!(
+                                "Session cost ${:.4} has reached {:.0}% of the ${max:.2} budget. {}",
+                                estimate.raw_usd,
+                                threshold * 100.0,
+                                total_usage.cache_summary(),
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                turn_processing_ctx.session_stats.set_total_cost_usd(None);
+                if max_budget_usd.is_some() && !turn_processing_ctx.session_stats.cost_warning_emitted() {
+                    turn_processing_ctx.session_stats.mark_cost_warning_emitted();
+                    tracing::warn!(
+                        provider = %provider_name,
+                        model = %active_model,
+                        "Budget enforcement disabled because pricing metadata is unavailable"
+                    );
+                    let _ = turn_processing_ctx.renderer.line(
+                        MessageStyle::Info,
+                        "Budget limit is not enforced for this model because pricing metadata is unavailable.",
+                    );
+                }
+            }
+        }
+        if !response.tool_references.is_empty() {
+            turn_processing_ctx
+                .tool_catalog
+                .note_tool_references(turn_processing_ctx.tools, &response.tool_references)
+                .await;
+        }
+
+        {
+            if turn_processing_ctx.is_planning_active() {
+                turn_processing_ctx.plan_session.increment_turns();
+            }
+        }
+
+        // Plan-mode robustness: if the planning synthesis was truncated at the
+        // model's output token limit, the emitted plan is incomplete ("cut off
+        // mid-flight"). Rather than accept a partial plan or re-enter the
+        // recovery path (which previously looped forever), ask for a tighter
+        // spec and retry once. Bounded so a genuinely oversized plan cannot
+        // loop. The policy lives in the planning-workflow facade so this loop
+        // stays free of plan-mode specifics.
+        let planning_active = turn_processing_ctx.is_planning_active();
+        if crate::agent::runloop::unified::planning_workflow::maybe_condense_truncated_plan(
+            &mut *turn_processing_ctx.working_history,
+            &mut *turn_processing_ctx.renderer,
+            planning_active,
+            tool_free_recovery,
+            &mut plan_condense_attempts,
+            &response,
+        ) {
+            continue;
+        }
+
+        // Process the LLM response
+        let processing_result_outcome = {
+            let allow_plan_interview = turn_processing_ctx.is_planning_active()
+                && turn_config.request_user_input_enabled
+                && crate::agent::runloop::unified::turn::turn_processing::planning_workflow_interview_ready(
+                    turn_processing_ctx.session_stats,
+                    turn_processing_ctx.plan_session,
+                );
+            process_llm_response(
+                &response,
+                turn_processing_ctx.renderer,
+                turn_processing_ctx.working_history.len(),
+                turn_processing_ctx.is_planning_active(),
+                allow_plan_interview,
+                turn_config.request_user_input_enabled,
+                !tool_free_recovery,
+                Some(&validation_cache),
+                Some(turn_processing_ctx.tool_registry),
+            )
+        };
+        let mut processing_result = match processing_result_outcome {
+            Ok(result) => result,
+            Err(err) => {
+                let err_cat = vtcode_commons::classify_anyhow_error(&err);
+                if err_cat.is_retryable() {
+                    tracing::warn!(
+                        error = %err,
+                        step = step_count,
+                        category = ?err_cat,
+                        "Response parse failed with transient error; skipping extra request retry"
+                    );
+                }
+
+                {
+                    let mut recovery = turn_processing_ctx.error_recovery.write().await;
+                    recovery.record_error("llm_response_parse", format!("{err:#}"), ErrorType::Other);
+                }
+                let tool_free_recovery =
+                    turn_processing_ctx.recovery_pass_used() && turn_processing_ctx.recovery_is_tool_free();
+                let planning = turn_processing_ctx.is_planning_active();
+                match dispatch_post_tool_failure(PostToolRecoveryContext {
+                    renderer: &mut *turn_processing_ctx.renderer,
+                    working_history: &mut *turn_processing_ctx.working_history,
+                    harness_state: &mut *turn_processing_ctx.harness_state,
+                    plan_session: planning.then_some(&mut *turn_processing_ctx.plan_session),
+                    plan_state: planning.then_some(&turn_processing_ctx.tool_registry.planning_workflow_state()),
+                    err: &err,
+                    step_count,
+                    turn_history_start_len,
+                    stage: "process_llm_response",
+                    tool_free_recovery,
+                })
+                .await?
+                {
+                    PostToolFailureAction::Continue => continue,
+                    PostToolFailureAction::Break(r) => {
+                        result = r;
+                        break;
+                    }
+                    PostToolFailureAction::Fallthrough => {}
+                }
+                return Err(err);
+            }
+        };
+        // When in tool-free recovery and the model returns no text (e.g. producing
+        // tool calls that get discarded), retry with a more explicit directive
+        // rather than immediately falling back to the deterministic final answer.
+        if tool_free_recovery
+            && matches!(processing_result, TurnProcessingResult::Empty)
+            && response.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+            && turn_processing_ctx.recovery_retry_count() < MAX_RECOVERY_RETRIES
+        {
+            let directive = if turn_processing_ctx.is_planning_active() {
+                RECOVERY_TOOL_CALL_RETRY_DIRECTIVE_PLAN_MODE
+            } else {
+                RECOVERY_TOOL_CALL_RETRY_DIRECTIVE
+            };
+            turn_processing_ctx
+                .working_history
+                .push(uni::Message::system(directive.to_string()));
+            turn_processing_ctx.retry_recovery_pass();
+            continue;
+        }
+        // During the tool-free recovery pass, tools are disabled at the API
+        // level, so an injected `request_user_input` interview call can never
+        // be executed — it only trips the recovery contract guard and collapses
+        // the turn to a dead-end fallback. Skip interview synthesis/forcing
+        // here; the recovery synthesis can still produce a valid text answer.
+        if turn_config.request_user_input_enabled && !tool_free_recovery && turn_processing_ctx.is_planning_active() {
+            processing_result = maybe_force_planning_workflow_interview(
+                processing_result,
+                response.content.as_deref(),
+                turn_processing_ctx.session_stats,
+                turn_processing_ctx.plan_session,
+                turn_processing_ctx.working_history.len(),
+            );
+        }
+
+        // Restore input status if there are no tool calls (turn is completing)
+        // This handles the case where defer_restore was set but no tool spinners will take over
+        let has_tool_calls = matches!(processing_result, TurnProcessingResult::ToolCalls { .. });
+        if !has_tool_calls {
+            turn_processing_ctx.restore_input_status(restore_status_left, restore_status_right);
+        }
+
+        if has_tool_calls {
+            turn_processing_ctx.set_phase(TurnPhase::ExecutingTools);
+        } else {
+            turn_processing_ctx.set_phase(TurnPhase::Finalizing);
+        }
+
+        // Handle the turn processing result (dispatch tool calls or finish turn)
+        let turn_outcome_result = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut turn_processing_ctx,
+            processing_result,
+            response_streamed,
+            step_count,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: current_max_tool_loops,
+            tool_repeat_limit: turn_config.tool_repeat_limit,
+        })
+        .await;
+        let turn_outcome = match turn_outcome_result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // Record result-handler errors for diagnostics (mirrors llm_request recording)
+                ctx.error_recovery.write().await.record_error(
+                    "turn_result_handler",
+                    format!("{err:#}"),
+                    ErrorType::ToolExecution,
+                );
+                let tool_free_recovery =
+                    ctx.harness_state.recovery_pass_used() && ctx.harness_state.recovery_is_tool_free();
+                let planning = ctx.is_planning_active();
+                match dispatch_post_tool_failure(PostToolRecoveryContext {
+                    renderer: &mut *ctx.renderer,
+                    working_history: &mut *working_history,
+                    harness_state: &mut *ctx.harness_state,
+                    plan_session: planning.then_some(&mut *ctx.plan_session),
+                    plan_state: planning.then_some(&ctx.tool_registry.planning_workflow_state()),
+                    err: &err,
+                    step_count,
+                    turn_history_start_len,
+                    stage: "handle_turn_processing_result",
+                    tool_free_recovery,
+                })
+                .await?
+                {
+                    PostToolFailureAction::Continue => continue,
+                    PostToolFailureAction::Break(r) => {
+                        result = r;
+                        break;
+                    }
+                    PostToolFailureAction::Fallthrough => {}
+                }
+                return Err(err);
+            }
+        };
+        // Record token usage before continuing or breaking
+        ctx.context_manager.update_token_usage(&response_usage);
+        #[cfg(debug_assertions)]
+        ctx.context_manager.validate_token_tracking(&response_usage);
+
+        match turn_outcome {
+            TurnHandlerOutcome::Continue => continue,
+            TurnHandlerOutcome::SwitchPrimaryAgent(agent) => {
+                // Plan-mode "switch to build/auto agent" decision: end the turn
+                // normally and let the interaction loop perform the handoff.
+                pending_primary_agent = Some(agent);
+                result = TurnLoopResult::Completed;
+                break;
+            }
+            TurnHandlerOutcome::Break(outcome_result) => {
+                // When the model violates the tool-free recovery contract
+                // (emits tool calls or textual tool-call markup instead of a
+                // final answer), retry the synthesis pass with a corrective
+                // directive instead of immediately concluding with the
+                // deterministic fallback answer. Mirrors the Empty+tool_calls
+                // retry path above. Observed in checkpoint turn_621: a single
+                // textual `<tool_call>` block in the recovery response
+                // terminated the turn and discarded ~60 messages of gathered
+                // context.
+                let contract_violation = matches!(
+                    outcome_result,
+                    TurnLoopResult::Blocked {
+                        reason: Some(ref reason)
+                    } if reason == RECOVERY_CONTRACT_VIOLATION_REASON
+                );
+                if tool_free_recovery
+                    && contract_violation
+                    && ctx.harness_state.recovery_retry_count() < MAX_RECOVERY_RETRIES
+                    && ctx.harness_state.retry_recovery_pass()
+                {
+                    tracing::warn!(
+                        retry = ctx.harness_state.recovery_retry_count(),
+                        max = MAX_RECOVERY_RETRIES,
+                        "Recovery contract violation; retrying tool-free synthesis pass"
+                    );
+                    let directive = if ctx.is_planning_active() {
+                        RECOVERY_TOOL_CALL_RETRY_DIRECTIVE_PLAN_MODE
+                    } else {
+                        RECOVERY_TOOL_CALL_RETRY_DIRECTIVE
+                    };
+                    working_history.push(uni::Message::system(directive.to_string()));
+                    continue;
+                }
+                // Wall-clock-exhausted planning turns must finalize instead of
+                // re-forcing the interview (see `dispatch_post_tool_failure`).
+                if tool_free_recovery
+                    && (ctx.harness_state.wall_clock_exhausted_emitted
+                        || ctx.harness_state.wall_clock_exhausted()
+                        || ctx.harness_state.tool_budget_exhausted_emitted)
+                    && ctx.is_planning_active()
+                {
+                    ctx.plan_session.mark_recovery_exhausted();
+                }
+                let salvaged = ctx.harness_state.take_recovery_rejected_synthesis();
+                let planning = ctx.is_planning_active();
+                let plan_session_opt = planning.then_some(&mut *ctx.plan_session);
+                let plan_state = ctx.tool_registry.planning_workflow_state();
+                let plan_state_opt = planning.then_some(&plan_state);
+                result = normalize_tool_free_recovery_break_outcome(
+                    working_history,
+                    outcome_result,
+                    tool_free_recovery,
+                    salvaged,
+                    plan_session_opt,
+                    plan_state_opt,
+                )
+                .await;
+                break;
+            }
+        }
+    }
+
+    ctx.set_phase(TurnPhase::Finalizing);
+    finalize_turn(&mut ctx, working_history, &result, &turn_usage).await;
+
+    // Final outcome with the correct result status
+    ctx.session_stats.record_turn_completed();
+    Ok(TurnLoopOutcome { result, turn_modified_files, pending_primary_agent })
+}
+
+/// Finalize the turn: terminate sessions if needed, emit outcome events,
+/// and send notifications.
+async fn finalize_turn(
+    ctx: &mut TurnLoopContext<'_>,
+    working_history: &[uni::Message],
+    result: &TurnLoopResult,
+    turn_usage: &HarnessUsage,
+) {
+    if matches!(result, TurnLoopResult::Cancelled | TurnLoopResult::Exit)
+        && let Err(err) = ctx.tool_registry.terminate_all_exec_sessions_async().await
+    {
+        tracing::warn!(error = %err, "Failed to terminate all exec sessions after turn stop");
+    }
+    if let Some(emitter) = ctx.harness_emitter {
+        // Exit is a graceful user-initiated action, not a failure
+        let event = match result {
+            TurnLoopResult::Completed | TurnLoopResult::Exit => turn_completed_event(turn_usage.clone()),
+            TurnLoopResult::Aborted => {
+                turn_failed_event("turn aborted", has_turn_usage(turn_usage).then_some(turn_usage.clone()))
+            }
+            TurnLoopResult::Cancelled => {
+                turn_failed_event("turn cancelled", has_turn_usage(turn_usage).then_some(turn_usage.clone()))
+            }
+            TurnLoopResult::Blocked { .. } => {
+                turn_failed_event("turn blocked", has_turn_usage(turn_usage).then_some(turn_usage.clone()))
+            }
+        };
+        if let Err(e) = emitter.emit(event) {
+            tracing::debug!(error = %e, "harness turn outcome event emission failed");
+        }
+    }
+    emit_turn_outcome_notification(
+        ctx.vt_cfg,
+        working_history,
+        ctx.config.workspace.as_path(),
+        ctx.harness_state,
+        result,
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod tests;

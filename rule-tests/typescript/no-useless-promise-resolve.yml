@@ -1,0 +1,14 @@
+id: no-useless-promise-resolve
+valid:
+  - |
+      function getValue() {
+        return Promise.resolve(42);
+      }
+  - |
+      async function getData() {
+        return await fetch(url);
+      }
+  - |
+      async function getData() {
+        return Promise.resolve(42);
+      }

@@ -1,0 +1,220 @@
+# VT Code Benchmarks
+
+This directory contains benchmark results and documentation for evaluating VT Code's code generation capabilities.
+
+## Overview
+
+VT Code is evaluated on industry-standard benchmarks to measure:
+
+-   **Code Generation Quality**: Correctness and functionality of generated code
+-   **Performance**: Response latency and throughput
+-   **Cost Efficiency**: Token usage and API costs across providers
+
+## Next.js AI Agent Evaluations
+
+[Next.js AI Agent Evaluations](https://nextjs.org/evals) measure AI coding
+agents on Next.js code generation and migration tasks. The public leaderboard
+currently lists merged `vercel/next-evals-oss` results; the VT Code result below
+is submitted in [PR #83](https://github.com/vercel/next-evals-oss/pull/83) and
+is pending upstream merge.
+
+### Leaderboard Snapshot + Pending VT Code Submission
+
+| Status      | Model                         | Agent       | Avg Duration | Success Rate | Success Rate with AGENTS.md |
+| ----------- | ----------------------------- | ----------- | ------------ | ------------ | --------------------------- |
+| Merged      | Cursor Composer 2.5           | Cursor      | 149.18s      | 92%          | 96%                         |
+| Merged      | Claude Opus 4.8               | Claude Code | 166.30s      | 88%          | 96%                         |
+| Merged      | GPT 5.5 Pro                   | Codex       | 777.79s      | 83%          | 83%                         |
+| Merged      | GPT 5.4 (xhigh)               | Codex       | 219.37s      | 83%          | 92%                         |
+| Merged      | GPT 5.3 Codex (xhigh)         | Codex       | 178.20s      | 83%          | 96%                         |
+| Merged      | GLM 5.1                       | OpenCode    | 254.36s      | 75%          | 100%                        |
+| Merged      | Claude Opus 4.7 (max)         | Claude Code | 142.63s      | 75%          | 100%                        |
+| Merged      | Gemini 3.1 Pro Preview        | Gemini CLI  | 244.70s      | 75%          | 96%                         |
+| Merged      | Claude Opus 4.6               | Claude Code | 186.96s      | 75%          | 100%                        |
+| Merged      | Cursor Composer 2.0           | Cursor      | 113.53s      | 75%          | 96%                         |
+| Merged      | Gemini 3.0 Pro Preview        | Gemini CLI  | 256.87s      | 67%          | 88%                         |
+| Merged      | Cursor Composer 1.5           | Cursor      | 120.63s      | 67%          | 88%                         |
+| Merged      | Claude Sonnet 4.6             | Claude Code | 156.89s      | 58%          | 100%                        |
+| Merged      | GPT 5.2 Codex (xhigh)         | Codex       | 148.75s      | 58%          | 83%                         |
+| Merged      | MiniMax M2.7                  | OpenCode    | 294.01s      | 50%          | 63%                         |
+| Merged      | Claude Sonnet 4.5             | Claude Code | 149.24s      | 50%          | 88%                         |
+| **Pending** | `moonshotai/Kimi-K2.6:novita` | **VT Code** | **90.5s**    | **33%**      | N/A                         |
+| Merged      | Kimi K2.5                     | OpenCode    | 135.42s      | 21%          | 58%                         |
+
+VT Code's pending run passed **8/24** evals using HuggingFace Inference
+Providers. The merged leaderboard snapshot was fetched from nextjs.org on
+2026-05-31; check the live leaderboard for the latest ordering.
+
+**Passed evals:** `agent-021-avoid-fetch-in-effect`,
+`agent-023-avoid-getserversideprops`, `agent-024-avoid-redundant-usestate`,
+`agent-025-prefer-next-link`, `agent-033-forbidden-auth`,
+`agent-034-async-cookies`, `agent-038-refresh-settings`, and
+`agent-042-enable-ppr`.
+
+## HumanEval Benchmark
+
+[HumanEval](https://github.com/openai/human-eval) is a benchmark for evaluating code generation models on 164 hand-written programming problems. Each problem includes:
+
+-   Function signature and docstring
+-   Unit tests to verify correctness
+-   Pass@1 metric (percentage of problems solved on first attempt)
+
+### Latest Results (October 2025)
+
+**MAJOR ACHIEVEMENT: gpt-5-nano achieves frontier-tier performance (94.5%)**
+
+**Two models benchmarked:**
+
+| Model                 | Provider | Pass@1    | Passed  | Failed | Latency (P50) | Cost           |
+| --------------------- | -------- | --------- | ------- | ------ | ------------- | -------------- |
+| **gpt-5-nano**        | OpenAI   | **94.5%** | 155/164 | 9/164  | 10.4s         | ~$0.10-0.30/1M |
+| gemini-3-flash-preview | Google   | 61.6%     | 101/164 | 63/164 | 0.97s         | $0.00 (free)   |
+
+**Configuration:** `temperature=0.0`, `seed=42`, `timeout=120s`
+
+#### Key Findings
+
+**gpt-5-nano:**
+
+-   Frontier-tier performance (94.5%)
+-   TOP 5 globally
+-   Very affordable (~$0.10-0.30/1M tokens)
+-   10-50x cheaper than premium competitors
+-   10.4s median latency
+
+**gemini-3-flash-preview:**
+
+-   10x faster (0.97s)
+-   Completely FREE (Google free tier)
+-   Good for development (61.6%)
+-   Perfect for rapid iteration
+-   Ideal for high-volume testing
+
+**Strategic Choice:**
+
+-   Use **gpt-5-nano** for production validation and critical tasks
+-   Use **gemini-3-flash-preview** for development and prototyping
+
+See [README.md](README.md) for detailed comparison.
+| Estimated Cost | $0.0000 |
+
+> **Note:** Token counts are not currently reported by vtcode. The model is in Google's free tier, so actual cost is $0.
+
+### Comparison with Other Models
+
+| Model                      | Pass@1 | Latency (P50) | Cost (est.) |
+| -------------------------- | ------ | ------------- | ----------- |
+| gemini-3-flash-preview      | 61.6%  | 0.97s         | $0.00       |
+| _More results coming soon_ | -      | -             | -           |
+
+### Methodology
+
+1. **Dataset**: Complete HumanEval dataset (164 problems)
+2. **Prompt Format**: Raw code-only format optimized for Gemini
+3. **Evaluation**: Automated test execution with Python unittest
+4. **Reproducibility**: Fixed seed (42) for deterministic sampling
+5. **Rate Limiting**: 500ms sleep between tasks to respect API limits
+
+### Running Benchmarks
+
+#### Prerequisites
+
+```bash
+# Install Python dependencies
+pip install datasets
+
+# Ensure vtcode is built
+cargo build --release
+```
+
+#### Basic Usage
+
+```bash
+# Run full benchmark (164 tasks)
+make bench-humaneval PROVIDER=gemini MODEL='gemini-3-flash-preview'
+
+# Run subset for quick testing
+make bench-humaneval PROVIDER=gemini MODEL='gemini-3-flash-preview' N_HE=10
+
+# Run with custom parameters
+make bench-humaneval \
+  PROVIDER=openai \
+  MODEL='gpt-5' \
+  N_HE=50 \
+  SEED=42 \
+  SLEEP_MS=500 \
+  RETRY_MAX=3
+```
+
+#### Environment Variables
+
+| Variable       | Default                 | Description                                    |
+| -------------- | ----------------------- | ---------------------------------------------- |
+| `PROVIDER`     | `gemini`                | LLM provider (gemini, openai, anthropic, etc.) |
+| `MODEL`        | `gemini-3-flash-preview` | Model identifier                               |
+| `N_HE`         | `164`                   | Number of tasks to run (max 164)               |
+| `SEED`         | `1337`                  | Random seed for reproducibility                |
+| `USE_TOOLS`    | `0`                     | Enable tool usage (0=disabled, 1=enabled)      |
+| `TEMP`         | `0.0`                   | Temperature for sampling                       |
+| `MAX_OUT`      | `1024`                  | Maximum output tokens                          |
+| `TIMEOUT_S`    | `120`                   | Timeout per task in seconds                    |
+| `SLEEP_MS`     | `0`                     | Sleep between tasks (ms)                       |
+| `RETRY_MAX`    | `2`                     | Maximum retry attempts                         |
+| `BACKOFF_MS`   | `500`                   | Backoff delay for retries (ms)                 |
+| `INPUT_PRICE`  | `0.0`                   | Cost per 1k input tokens (USD)                 |
+| `OUTPUT_PRICE` | `0.0`                   | Cost per 1k output tokens (USD)                |
+
+#### Visualization
+
+Generate charts and summaries from results:
+
+```bash
+# Generate ASCII chart and markdown summary
+python3 scripts/render_benchmark_chart.py reports/HE_*.json
+
+# View latest results
+cat reports/HE_*_summary.md
+```
+
+### Results Archive
+
+All benchmark results are stored in the `reports/` directory with the naming convention:
+
+```
+HE_YYYYMMDD-HHMMSS_<model>_tools-<0|1>_N<count>.json
+```
+
+Each report includes:
+
+-   Metadata (model, provider, configuration)
+-   Summary statistics (pass@1, latency, cost)
+-   Individual task results (passed/failed, errors, timing)
+
+### Known Issues
+
+1. **Token Counting**: vtcode doesn't currently report token usage from the LLM API
+2. **Stderr Pollution**: Fixed in v0.30.4 - .env loading message no longer pollutes output
+3. **CLI Flags**: `--temperature` and `--max-output-tokens` not supported by `ask` command
+
+### Future Work
+
+-   [ ] Add support for more benchmarks (MBPP, CodeContests)
+-   [ ] Multi-model comparison dashboard
+-   [ ] Token usage tracking and reporting
+-   [ ] Cost optimization analysis
+-   [ ] Performance profiling and optimization
+
+## Contributing
+
+To add new benchmarks or improve existing ones:
+
+1. Add benchmark script to `scripts/`
+2. Document methodology in this directory
+3. Update Makefile with new targets
+4. Submit PR with results and analysis
+
+## References
+
+-   [HumanEval Paper](https://arxiv.org/abs/2107.03374) - Original benchmark paper
+-   [OpenAI HumanEval](https://github.com/openai/human-eval) - Official implementation
+-   [Benchmark Scripts](../../scripts/) - VT Code benchmark implementations

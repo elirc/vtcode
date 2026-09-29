@@ -1,0 +1,489 @@
+# Getting Started with VT Code
+
+Welcome to VT Code! This guide will help you get up and running with this Rust-based terminal coding agent that provides intelligent.
+
+## What Makes VT Code Special
+
+VT Code represents a modern approach to AI-powered software development, featuring:
+
+-   **Multi-Provider LLM Support** - Gemini, OpenAI, Anthropic, DeepSeek, OpenRouter, Z.AI, Moonshot, StepFun, MiniMax, and more
+-   **Enhanced Terminal Interface** - Modern TUI with mouse support and text selection
+-   **Advanced Code Intelligence** - Tree-sitter parsers for 6+ programming languages
+-   **Enterprise-Grade Safety** - Comprehensive security controls and path validation
+-   **Flexible Configuration** - TOML-based configuration with granular policies
+-   **Research-Preview Features** - Cutting-edge agent coordination and context engineering
+-   **Workspace-First Operations** - Full read/write/command access within `WORKSPACE_DIR` and built-in project indexing
+
+## Prerequisites
+
+### System Requirements
+
+-   **Rust**: 1.88+ (stable recommended)
+    -   Install from [rustup.rs](https://rustup.rs/)
+    -   Includes Cargo package manager
+-   **Git**: For version control and cloning the repository
+-   **Operating System**: macOS, Linux, or Windows (with WSL2)
+
+For contributor workflow setup (tooling, checks, and test loop), use the canonical [Development Setup](../development/DEVELOPMENT_SETUP.md) guide.
+
+### API Requirements
+
+Choose one of the supported LLM providers:
+
+-   **Gemini** (Primary): `export GEMINI_API_KEY=your_key_here` or `export GOOGLE_API_KEY=your_key_here`
+
+    -   Get from [Google AI Studio](https://aistudio.google.com/app/apikey)
+
+-   **OpenAI**: `export OPENAI_API_KEY=your_key_here`
+
+    -   Get from [OpenAI Platform](https://platform.openai.com/api-keys)
+
+-   **Anthropic**: `export ANTHROPIC_API_KEY=your_key_here`
+    -   Get from [Anthropic Console](https://console.anthropic.com/)
+
+-   **Z.AI**: `export ZAI_API_KEY=your_key_here`
+    -   Get from [Z.AI Platform](https://z.ai/docs)
+    -   Models: GLM-5.2, GLM-5.1, GLM-4.7
+
+-   **Moonshot (Kimi)**: `export MOONSHOT_API_KEY=your_key_here`
+    -   Get from [Moonshot Platform](https://platform.moonshot.ai/docs)
+    -   Models: Kimi K2.7 Code, K2.6, K2.5
+
+-   **StepFun**: `export STEPFUN_API_KEY=your_key_here`
+    -   Get from [StepFun Platform](https://platform.stepfun.ai/docs)
+    -   Models: Step-3.7-Flash
+
+-   **MiniMax**: `export MINIMAX_API_KEY=your_key_here`
+    -   Get from [MiniMax Platform](https://platform.minimax.io/docs)
+    -   Models: MiniMax-M3, M2.7, M2.5
+
+For more providers, see the [Provider Guides](../providers/PROVIDER_GUIDES.md).
+
+## Installation
+
+### Option 1: Direct Download (Recommended)
+
+```bash
+# Clone the repository
+git clone https://github.com/vinhnx/vtcode.git
+cd vtcode
+
+# Build the project
+cargo build --release
+
+# The binary will be available at target/release/vtcode
+```
+
+### Option 2: Using Provided Scripts
+
+```bash
+# Clone and build using the production script
+git clone https://github.com/vinhnx/vtcode.git
+cd vtcode
+
+# Build and run in production mode
+./scripts/run.sh
+
+# Or build and run in development mode
+./scripts/run-debug.sh
+```
+
+### Option 3: Cargo Install (Future)
+
+```bash
+# When published to crates.io
+cargo install vtcode
+
+# Optional: install search dependencies after VT Code is on PATH
+vtcode dependencies install search-tools
+```
+
+## Quick Start
+
+### 1. Set Your API Key
+
+```bash
+# For Gemini (recommended)
+export GEMINI_API_KEY=your_api_key_here
+
+# For OpenAI
+export OPENAI_API_KEY=your_api_key_here
+
+# For Anthropic
+export ANTHROPIC_API_KEY=your_api_key_here
+```
+
+On first launch in a fresh workspace, VT Code auto-discovers any provider whose key is already in your shell environment (so if you `export OPENROUTER_API_KEY` in `~/.zshrc`, the setup wizard detects it and skips re-prompting). The wizard tells you exactly which environment variable it read — e.g. "Found credentials for: OpenRouter (OPENROUTER_API_KEY), Gemini (GOOGLE_API_KEY)." — so alternate env vars (such as `GOOGLE_API_KEY` for Gemini, or `DASHSCOPE_API_KEY` for Qwen) are surfaced explicitly. The provider picker shows ready providers first, marks each with `✓` (real credential) or `•` (local / managed-auth), and defaults the cursor to one you can use immediately. You can switch providers anytime with `/model`.
+
+If no key is in your environment, the wizard lets you paste one now or skip and set it later via `/model`. The paste flow is built for safe input:
+
+-   **Input is hidden** — terminal echo is disabled while you paste, so the key never appears in your scrollback or terminal recordings (each character shows as `*`). If stdin is not a terminal, the wizard warns you and falls back to visible input.
+-   **Masked preview + confirm** — before saving, the wizard shows a masked preview (e.g. `sk-or-v1-…7Q2x`) and the key length, and asks you to confirm. A paste mistake can be discarded and re-entered without restarting the wizard.
+-   **Stored in your OS keyring, not a workspace `.env`** — the secret is never duplicated per project. If a key is already stored, the wizard offers to use it or replace it (so you can rotate keys without leaving setup).
+
+If you have no provider key at all, the wizard still offers a path forward: local providers like Ollama, LM Studio, and llama.cpp need no key.
+
+### 2. Confirm Workspace Context
+
+`WORKSPACE_DIR` tells VT Code which project folder to treat as its primary context. The CLI sets this automatically when you launch inside a directory, but you can override or verify it explicitly:
+
+```bash
+# Confirm the workspace root
+echo "Workspace: $WORKSPACE_DIR"
+
+# Override if you need to target a different project
+export WORKSPACE_DIR="/path/to/your/project"
+
+# One-off override when launching commands
+vtcode chat --workspace-dir /path/to/your/project
+vtcode /path/to/your/project
+```
+
+### 3. Initialize VT Code in Your Project
+
+```bash
+# Navigate to your project
+cd /path/to/your/project
+
+# Initialize VT Code (creates vtcode.toml and .vtcodegitignore)
+../vtcode/target/release/vtcode init
+```
+
+### 4. Start Your First Session
+
+```bash
+# Start interactive chat
+../vtcode/target/release/vtcode chat
+```
+
+### Resume Previous Sessions
+
+- Run `vtcode --resume` to open an interactive picker of recent sessions, or `vtcode --resume <SESSION_ID>` to jump directly to a known session.
+- Use `vtcode --continue` to resume the most recent session automatically without picking from the list.
+- These flags are global; do not append a subcommand (for example, `vtcode chat --resume` is rejected). Resume or continue first, then start a new command if needed.
+
+## Enhanced Terminal Interface
+
+VT Code now features a completely revamped terminal user interface with numerous enhancements:
+
+### Visual Improvements
+- Modern, clean interface with rounded borders and improved styling
+- Customizable color themes with Catppuccin color palette integration
+- Enhanced message formatting with distinct markers for different message types
+- Color-coded tool banners highlight execution summaries, detailed output, and MCP status updates
+- Real-time command output display with proper ANSI color support
+
+### Interaction Features
+- Full mouse support for scrolling and text selection
+- Interactive text selection with click-and-drag functionality
+- Improved input area with placeholder text ("Implement {feature}...")
+- Slash command auto-suggestions for quick access to built-in commands
+
+### Terminal Command Support
+- Real-time PTY (pseudo-terminal) integration for running shell commands
+- Dedicated terminal output panels with command summaries
+- Streaming output display for long-running processes
+- Proper handling of ANSI escape sequences and colors
+
+### Navigation & Controls
+- Smooth scrolling with mouse wheel and keyboard shortcuts
+- Page navigation with Page Up/Down keys
+- Dedicated status bar with contextual information
+- Clear exit and cancel controls (Esc key)
+
+## Configuration
+
+### Quick Slash Commands
+
+During chat you can lead with `/` to trigger built-in actions without leaving the session:
+
+-   `/help` — list supported commands
+
+-   `/theme <id>` — switch the active theme
+-   `/command <program> [args...]` — run a shell command via `exec_command`
+-   `/agents` — create, inspect, edit, or delete subagent definitions with VT Code-native frontmatter
+-   `/agent` — inspect delegated child threads in the current session
+
+Press **Tab** on an empty idle composer to cycle primary agents. The active primary agent appears in the session header badge and controls the session's instructions, model, granular permission policy, and tool access.
+
+Slash commands execute immediately and respect the same tool policies configured in `vtcode.toml`.
+
+For delegated child-agent workflows and primary agents, see the dedicated [Subagents guide](./subagents.md). Primary agents (`mode: primary` or `mode: all`) control the main session directly; subagents (`mode: subagent` or `mode: all`) are spawned as child threads via `@agent-name`. New `.vtcode/agents/*.md` files should use VT Code tool ids such as `exec_command`, `write_stdin`, `apply_patch`, and advanced `code_search`, not Claude-style names like `Read` or `Bash`.
+
+VT Code uses a comprehensive TOML configuration system. The `init` command creates a `vtcode.toml` file with sensible defaults.
+
+### Basic Configuration
+
+```toml
+# Agent settings
+[agent]
+provider = "openai"  # or anthropic, google, deepseek, etc.
+default_model = "gpt-5.4"  # Your preferred model
+max_conversation_turns = 150
+
+# Security settings
+[features]
+human_in_the_loop = true   # enable human-in-the-loop tool approval
+
+# Tool policies
+[tools]
+default_policy = "prompt"
+
+[tools.policies]
+exec_command = "prompt"
+code_search = "allow"
+apply_patch = "prompt"
+```
+
+### Advanced Configuration
+
+```toml
+# Command permissions
+[commands]
+allow_list = ["ls", "pwd", "cat", "git status", "cargo check"]
+deny_list = ["rm -rf", "sudo rm", "shutdown"]
+
+# PTY settings
+[pty]
+enabled = true
+default_rows = 24
+default_cols = 80
+command_timeout_seconds = 300
+
+# Lifecycle hooks - Execute shell commands in response to agent events
+# For comprehensive examples and setup, see: ../../guides/lifecycle-hooks.md
+[hooks.lifecycle]
+# Example: Run security validation before bash commands
+pre_tool_use = [
+  { 
+    matcher = "Bash",
+    hooks = [ 
+      { 
+        command = "$VT_PROJECT_DIR/.vtcode/hooks/security-check.sh", 
+        timeout_seconds = 10 
+      } 
+    ] 
+  }
+]
+```
+
+### Session Onboarding
+
+VT Code opens each chat with a workspace-specific orientation generated by the context engine. Configure it with the `[agent.onboarding]` section:
+
+```toml
+[agent.onboarding]
+enabled = true
+intro_text = "Welcome! I preloaded workspace context so you can focus on decisions."
+include_project_overview = true
+include_language_summary = true
+include_guideline_highlights = true
+guideline_highlight_limit = 4
+usage_tips = [
+    "Share the outcome you need or ask for a quick /status summary.",
+    "Reference AGENTS.md expectations before changing files.",
+    "Draft or refresh your TODOs with task_tracker before editing.",
+    "Prefer targeted shell reads, rg search, or advanced code_search before editing.",
+]
+recommended_actions = [
+    "Outline a 3-6 step TODO plan via task_tracker before coding.",
+    "Request a workspace orientation or describe the task you want to tackle.",
+    "Confirm priorities or blockers so I can suggest next steps.",
+]
+# chat_placeholder = "Describe the task you want to tackle next."
+```
+
+When enabled, VT Code prints the onboarding message before the first prompt and appends the same context block to the system prompt for the model. Provide `chat_placeholder` only if you want a custom hint above the initial `>` prompt; leaving it unset keeps the input empty by default.
+
+### Terminal parity extras
+
+- Enable Vim-style prompt editing persistently with:
+
+```toml
+[ui]
+vim_mode = true
+```
+
+- Use `/vim` to toggle Vim mode for the current session only.
+- Use `/statusline` to generate a custom status-line command in either your user config or the current workspace.
+- Use `hooks.lifecycle.notification` if you want shell hooks for `permission_prompt` or `idle_prompt` notifications.
+
+## Usage Examples
+
+### Basic Chat Session
+
+```bash
+vtcode chat
+```
+
+The agent will greet you and await your instructions. Try asking:
+
+-   "Analyze this codebase"
+-   "Add error handling to the user authentication"
+-   "Refactor this function to be more readable"
+-   "Create a new API endpoint for user registration"
+
+### Command Line Queries
+
+For quick questions or piping to other tools, use the `ask` command:
+
+```bash
+vtcode ask "Write a Python function to calculate Fibonacci numbers" > fib.py
+```
+
+**Note**: `vtcode ask` sends the raw response code/text to **stdout**, while sending metadata (provider info, reasoning traces) to **stderr**. This makes it perfect for shell scripting and piping.
+
+### Project Analysis
+
+```bash
+# Comprehensive project analysis
+vtcode analyze
+
+# Get detailed information
+vtcode info
+
+# Generate project summary
+vtcode summary
+```
+
+## Understanding the Agents
+
+### Orchestrator Agent
+
+-   **Role**: Strategic coordinator and task planner
+-   **Capabilities**: Task decomposition, agent delegation, progress tracking
+-   **Use for**: Complex multi-step tasks requiring coordination
+
+### Explorer Agent
+
+-   **Role**: Investigation and verification specialist
+-   **Capabilities**: Code analysis, system exploration, testing
+-   **Use for**: Understanding codebases, verifying implementations
+
+### Coder Agent
+
+-   **Role**: Implementation specialist
+-   **Capabilities**: Code writing, refactoring, debugging
+-   **Use for**: Making code changes, adding features, fixing bugs
+
+## Advanced Features
+
+### Context Engineering
+
+VT Code automatically manages conversation context:
+
+-   **Intelligent compression** of long conversations
+-   **Persistent context store** across sessions
+-   **Automatic summarization** of completed tasks
+-   **Context-aware responses** based on full history
+
+### Safety Features
+
+Comprehensive security controls:
+
+-   **Path validation** - Prevents access outside workspace
+-   **Command policies** - Allow/deny lists for terminal commands
+-   **Human-in-the-loop** - Confirmation for dangerous operations
+-   **File size limits** - Prevents processing of large files
+-   **API key masking** - Secure credential handling
+
+### Tool Integration
+
+Rich tool ecosystem:
+
+-   **File Operations**: Read, write, edit files safely
+-   **Search & Analysis**: Fast text search and AST-based analysis
+-   **Terminal Commands**: Execute shell commands with PTY support
+-   **Code Intelligence**: Tree-sitter powered syntax analysis
+-   **Batch Operations**: Process multiple files efficiently
+
+## Troubleshooting
+
+### Common Issues
+
+#### API Key Not Set
+
+```bash
+# Check if API key is set
+echo $GEMINI_API_KEY
+
+# Set the API key
+export GEMINI_API_KEY=your_key_here
+```
+
+#### Configuration Issues
+
+```bash
+# Validate configuration
+vtcode config --validate
+
+# Reset to defaults
+vtcode config --reset
+```
+
+#### Build Issues
+
+```bash
+# Clean and rebuild
+cargo clean
+cargo build --release
+
+# Check Rust version
+rustc --version
+cargo --version
+```
+
+### Getting Help
+
+-   **Documentation**: Comprehensive guides in `docs/` directory
+-   **GitHub Issues**: Report bugs and request features
+-   **GitHub Discussions**: Community support and discussions
+-   **Configuration Examples**: Check `vtcode.toml.example`
+
+## Security & Safety
+
+VT Code is designed with security as a first-class concern:
+
+### Built-in Security Features
+
+- **Execution Policy** - Only 9 safe commands allowed by default
+- **Argument Validation** - Blocks dangerous flags like `--pre`, `-exec`, `-e`
+- **Workspace Isolation** - All operations confined to workspace boundaries
+- **Human-in-the-Loop** - Three-tier approval system for tool execution
+- **Sandbox Integration** - Optional Anthropic sandbox for network commands
+
+### Security Best Practices
+
+1. **Review Tool Approvals** - Check `~/.config/vtcode/tool_policy.toml` regularly
+2. **Use "Approve Once"** - For unfamiliar operations, don't auto-approve
+3. **Enable Sandbox** - For network commands, configure sandbox policy
+4. **Monitor Logs** - Review `.vtcode/logs/` for suspicious activity
+5. **Be Cautious** - Don't process code from untrusted sources
+
+### Learn More
+
+- **[Security Guide](../guides/security.md)** - Complete security documentation
+- **[Security Model](../security/SECURITY_MODEL.md)** - Architecture and threat model
+- **[Tool Policies](../modules/vtcode_tools_policy.md)** - Command execution policies
+
+## Next Steps
+
+Now that you have VT Code running, explore:
+
+1. **[Security Guide](../guides/security.md)** - Understand security features
+1. **[Lifecycle Hooks Guide](../guides/lifecycle-hooks.md)** - Execute shell commands in response to agent events for context enrichment, policy enforcement, and automation
+1. **[Configuration Guide](../config/CONFIGURATION_PRECEDENCE.md)** - Advanced configuration options and precedence rules
+1. **[Architecture Guide](../ARCHITECTURE.md)** - System design and components
+1. **[Provider Guides](../providers/PROVIDER_GUIDES.md)** - LLM provider integration
+   - [OpenRouter Integration](../providers/openrouter.md)
+
+## Contributing
+
+Interested in contributing? Check out:
+
+-   **[Development Guide](../development/README.md)** - Development setup
+-   **[Contributing Guide](../../docs/CONTRIBUTING.md)** - Contribution guidelines
+
+---
+
+**Happy coding with VT Code!** 

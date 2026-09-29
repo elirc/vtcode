@@ -1,0 +1,824 @@
+use super::recovery_guidance::{
+    empty_response_notice, empty_response_recovery_mode, empty_response_recovery_reason,
+    push_recovery_fallback_assistant_message, recovery_empty_fallback_safety_message,
+    recovery_empty_response_fallback_message,
+};
+use anyhow::Result;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use vtcode_core::llm::provider as uni;
+use vtcode_core::utils::ansi::MessageStyle;
+
+use crate::agent::runloop::unified::run_loop_context::RecoveryMode;
+use crate::agent::runloop::unified::turn::context::{
+    PreparedAssistantToolCall, TurnHandlerOutcome, TurnLoopResult, TurnProcessingContext, TurnProcessingResult,
+};
+use crate::agent::runloop::unified::turn::guards::handle_turn_balancer;
+use crate::agent::runloop::unified::turn::tool_outcomes::ToolOutcomeContext;
+use crate::agent::runloop::unified::turn::turn_loop::RECOVERY_CONTRACT_VIOLATION_REASON;
+
+/// Result of processing a single turn.
+pub(crate) struct HandleTurnProcessingResultParams<'a> {
+    pub ctx: &'a mut TurnProcessingContext<'a>,
+    pub processing_result: TurnProcessingResult,
+    pub response_streamed: bool,
+    pub step_count: usize,
+    pub repeated_tool_attempts: &'a mut crate::agent::runloop::unified::turn::tool_outcomes::helpers::LoopTracker,
+    pub turn_modified_files: &'a mut BTreeSet<PathBuf>,
+    /// Pre-computed max tool loops limit for efficiency.
+    pub max_tool_loops: usize,
+    /// Pre-computed tool repeat limit for efficiency.
+    pub tool_repeat_limit: usize,
+}
+
+fn should_suppress_pre_tool_result_claim(assistant_text: &str, tool_calls: &[PreparedAssistantToolCall]) -> bool {
+    if assistant_text.trim().is_empty() {
+        return false;
+    }
+    if !tool_calls.iter().any(PreparedAssistantToolCall::is_command_execution) {
+        return false;
+    }
+
+    let lower = assistant_text.to_ascii_lowercase();
+    [
+        "found ",
+        "warning",
+        "warnings",
+        "error",
+        "errors",
+        "passed",
+        "failed",
+        "no issues",
+        "completed successfully",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn record_assistant_tool_calls(
+    history: &mut Vec<uni::Message>,
+    tool_calls: &[PreparedAssistantToolCall],
+    history_len_before_assistant: usize,
+) {
+    if tool_calls.is_empty() {
+        return;
+    }
+
+    let raw_tool_calls = tool_calls
+        .iter()
+        .map(|tool_call| tool_call.raw_call().clone())
+        .collect::<Vec<_>>();
+
+    let appended_assistant_message = history.len() > history_len_before_assistant
+        && history
+            .last()
+            .is_some_and(|message| message.role == uni::MessageRole::Assistant && message.tool_calls.is_none());
+
+    if appended_assistant_message {
+        if let Some(last) = history.last_mut() {
+            last.tool_calls = Some(raw_tool_calls);
+            last.phase = Some(uni::AssistantPhase::Commentary);
+        }
+        return;
+    }
+
+    // Preserve call/output pairing even when the assistant text was merged into
+    // a prior message or omitted; OpenAI-compatible providers require tool call IDs.
+    history.push(
+        uni::Message::assistant_with_tools(String::new(), raw_tool_calls)
+            .with_phase(Some(uni::AssistantPhase::Commentary)),
+    );
+}
+
+/// Dispatch the appropriate response handler based on the processing result.
+pub(crate) async fn handle_turn_processing_result<'a>(
+    params: HandleTurnProcessingResultParams<'a>,
+) -> Result<TurnHandlerOutcome> {
+    match params.processing_result {
+        TurnProcessingResult::ToolCalls {
+            tool_calls,
+            assistant_text,
+            reasoning,
+            reasoning_details,
+        } => {
+            if params.ctx.is_recovery_active() && params.ctx.recovery_pass_used() && params.ctx.recovery_is_tool_free()
+            {
+                // Preserve any accompanying prose so an exhausted-retries
+                // fallback can salvage it instead of discarding the turn.
+                params
+                    .ctx
+                    .harness_state
+                    .record_recovery_rejected_synthesis(assistant_text.trim().to_string());
+                return Ok(TurnHandlerOutcome::Break(TurnLoopResult::Blocked {
+                    reason: Some(RECOVERY_CONTRACT_VIOLATION_REASON.to_string()),
+                }));
+            }
+
+            let assistant_text = if should_suppress_pre_tool_result_claim(&assistant_text, &tool_calls) {
+                String::new()
+            } else {
+                assistant_text
+            };
+            let assistant_text_len = assistant_text.len();
+            let reasoning_segments = reasoning.len();
+            let reasoning_details_count = reasoning_details.as_ref().map_or(0, Vec::len);
+            let history_len_before_assistant = params.ctx.working_history.len();
+            params.ctx.handle_assistant_response(
+                assistant_text,
+                reasoning,
+                reasoning_details,
+                params.response_streamed,
+                Some(uni::AssistantPhase::Commentary),
+            )?;
+            record_assistant_tool_calls(params.ctx.working_history, &tool_calls, history_len_before_assistant);
+            tracing::info!(
+                target: "vtcode.turn.metrics",
+                metric = "tool_call_turn_start",
+                run_id = %params.ctx.harness_state.run_id.0,
+                turn_id = %params.ctx.harness_state.turn_id.0,
+                tool_calls = tool_calls.len(),
+                assistant_text_len,
+                reasoning_segments,
+                reasoning_details = reasoning_details_count,
+                history_len = params.ctx.working_history.len(),
+                "turn metric"
+            );
+
+            let outcome = {
+                let mut t_ctx_inner = ToolOutcomeContext {
+                    ctx: &mut *params.ctx,
+                    repeated_tool_attempts: &mut *params.repeated_tool_attempts,
+                    turn_modified_files: &mut *params.turn_modified_files,
+                };
+
+                crate::agent::runloop::unified::turn::tool_outcomes::handle_tool_calls(&mut t_ctx_inner, &tool_calls)
+                    .await?
+            };
+
+            if let Some(res) = outcome {
+                tracing::info!(
+                    target: "vtcode.turn.metrics",
+                    metric = "tool_call_turn_outcome",
+                    run_id = %params.ctx.harness_state.run_id.0,
+                    turn_id = %params.ctx.harness_state.turn_id.0,
+                    outcome = "direct_break",
+                    "turn metric"
+                );
+                return Ok(res);
+            }
+
+            let balancer_outcome = handle_turn_balancer(
+                &mut *params.ctx,
+                params.step_count,
+                &mut *params.repeated_tool_attempts,
+                params.max_tool_loops,
+                params.tool_repeat_limit,
+            )
+            .await;
+            tracing::info!(
+                target: "vtcode.turn.metrics",
+                metric = "tool_call_turn_outcome",
+                run_id = %params.ctx.harness_state.run_id.0,
+                turn_id = %params.ctx.harness_state.turn_id.0,
+                outcome = match &balancer_outcome {
+                    TurnHandlerOutcome::Continue => "continue",
+                    TurnHandlerOutcome::Break(_) => "break",
+                    TurnHandlerOutcome::SwitchPrimaryAgent(_) => "switch_primary_agent",
+                },
+                "turn metric"
+            );
+            Ok(balancer_outcome)
+        }
+        TurnProcessingResult::TextResponse { text, reasoning, reasoning_details, proposed_plan } => {
+            if params.ctx.is_recovery_active()
+                && params.ctx.recovery_pass_used()
+                && params.ctx.recovery_is_tool_free()
+                && (crate::agent::runloop::text_tools::detect_textual_tool_call(&text).is_some()
+                    || crate::agent::runloop::text_tools::contains_pseudo_tool_call_markers(&text))
+            {
+                let cleaned = crate::agent::runloop::text_tools::strip_dsml_markup(&text).trim().to_string();
+                // If DSML stripping produced a clean, markup-free text, use it.
+                // Otherwise try stripping the entire detected non-DSML tool-call
+                // region while preserving surrounding prose.
+                if !cleaned.is_empty()
+                    && crate::agent::runloop::text_tools::detect_textual_tool_call(&cleaned).is_none()
+                    && !crate::agent::runloop::text_tools::contains_pseudo_tool_call_markers(&cleaned)
+                {
+                    let _ = params
+                        .ctx
+                        .renderer
+                        .line(MessageStyle::Info, "[i] Cleaned recovery response (removed tool-call markup).");
+                    return params
+                        .ctx
+                        .handle_text_response(
+                            cleaned,
+                            reasoning,
+                            reasoning_details,
+                            proposed_plan,
+                            params.response_streamed,
+                        )
+                        .await;
+                }
+                let cleaned = crate::agent::runloop::text_tools::strip_textual_tool_call_regions(&text)
+                    .trim()
+                    .to_string();
+                if !cleaned.is_empty()
+                    && crate::agent::runloop::text_tools::detect_textual_tool_call(&cleaned).is_none()
+                    && !crate::agent::runloop::text_tools::contains_pseudo_tool_call_markers(&cleaned)
+                {
+                    let _ = params
+                        .ctx
+                        .renderer
+                        .line(MessageStyle::Info, "[i] Cleaned recovery response (removed tool-call markup).");
+                    return params
+                        .ctx
+                        .handle_text_response(
+                            cleaned,
+                            reasoning,
+                            reasoning_details,
+                            proposed_plan,
+                            params.response_streamed,
+                        )
+                        .await;
+                }
+                // Both cleanup attempts failed. Salvage the best-effort
+                // stripped prose so an exhausted-retries fallback can use it
+                // instead of the canned answer.
+                let salvage = crate::agent::runloop::text_tools::strip_textual_tool_call_regions(
+                    &crate::agent::runloop::text_tools::strip_dsml_markup(&text),
+                )
+                .trim()
+                .to_string();
+                params.ctx.harness_state.record_recovery_rejected_synthesis(salvage);
+                return Ok(TurnHandlerOutcome::Break(TurnLoopResult::Blocked {
+                    reason: Some(RECOVERY_CONTRACT_VIOLATION_REASON.to_string()),
+                }));
+            }
+
+            params
+                .ctx
+                .handle_text_response(text, reasoning, reasoning_details, proposed_plan, params.response_streamed)
+                .await
+        }
+        TurnProcessingResult::Empty => {
+            if params.ctx.is_recovery_active() && params.ctx.recovery_pass_used() {
+                let recovery_mode = if params.ctx.recovery_is_tool_free() {
+                    RecoveryMode::ToolFreeSynthesis
+                } else {
+                    RecoveryMode::ToolEnabledRetry
+                };
+                let recovery_reason = if params.ctx.recovery_is_tool_free() {
+                    "Recovery mode requested a final synthesis pass, but the model returned no answer."
+                } else {
+                    "Recovery retry requested another autonomous pass, but the model still returned no answer."
+                };
+                let fallback_message = recovery_empty_response_fallback_message(
+                    params.ctx.working_history,
+                    params.ctx.tool_registry.workspace_root().as_path(),
+                    recovery_mode,
+                );
+
+                // Push the fallback message directly into working_history,
+                // bypassing `handle_assistant_response`'s skip-empty guard.
+                // The fallback is the user's only view of what happened when
+                // the model returns nothing during recovery; without forcing
+                // the push, the conversation can end with a silent "\n"
+                // assistant message and no actionable information.
+                let final_fallback = if fallback_message.trim().is_empty() {
+                    recovery_empty_fallback_safety_message(recovery_mode)
+                } else {
+                    fallback_message
+                };
+                push_recovery_fallback_assistant_message(
+                    params.ctx.working_history,
+                    &final_fallback,
+                    Some(uni::AssistantPhase::FinalAnswer),
+                );
+                params.ctx.finish_recovery_pass();
+                tracing::warn!(
+                    mode = ?recovery_mode,
+                    reason = recovery_reason,
+                    fallback_chars = final_fallback.len(),
+                    "Recovery pass returned no content; emitted deterministic fallback answer."
+                );
+                return Ok(TurnHandlerOutcome::Break(TurnLoopResult::Completed));
+            }
+
+            let recovery_mode = empty_response_recovery_mode(params.ctx.working_history);
+            let recovery_reason = empty_response_recovery_reason(recovery_mode).to_string();
+            params.ctx.activate_recovery_with_mode(recovery_reason.clone(), recovery_mode);
+            params
+                .ctx
+                .renderer
+                .line(MessageStyle::Info, empty_response_notice(recovery_mode))
+                .unwrap_or(());
+            params.ctx.working_history.push(uni::Message::system(recovery_reason));
+
+            Ok(TurnHandlerOutcome::Continue)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{
+        HandleTurnProcessingResultParams, handle_turn_processing_result, record_assistant_tool_calls,
+        should_suppress_pre_tool_result_claim,
+    };
+    use crate::agent::runloop::unified::run_loop_context::RecoveryMode;
+    use crate::agent::runloop::unified::turn::context::{
+        PreparedAssistantToolCall, TurnHandlerOutcome, TurnLoopResult, TurnProcessingResult,
+    };
+    use crate::agent::runloop::unified::turn::tool_outcomes::helpers::LoopTracker;
+    use crate::agent::runloop::unified::turn::turn_loop::RECOVERY_CONTRACT_VIOLATION_REASON;
+    use crate::agent::runloop::unified::turn::turn_processing::test_support::TestTurnProcessingBacking;
+    use vtcode_core::llm::provider as uni;
+
+    fn prepared_command_tool_call() -> PreparedAssistantToolCall {
+        PreparedAssistantToolCall::new(uni::ToolCall::function(
+            "call_1".to_string(),
+            "exec_command".to_string(),
+            r#"{"action":"run","command":"cargo clippy"}"#.to_string(),
+        ))
+    }
+
+    #[test]
+    fn suppresses_result_claims_before_run_tool_output() {
+        let tool_calls = vec![prepared_command_tool_call()];
+        assert!(should_suppress_pre_tool_result_claim("Found 3 clippy warnings. Let me fix them.", &tool_calls));
+    }
+
+    #[test]
+    fn keeps_non_result_preamble_for_run_tools() {
+        let tool_calls = vec![prepared_command_tool_call()];
+        assert!(!should_suppress_pre_tool_result_claim("Running cargo clippy now.", &tool_calls));
+    }
+
+    #[test]
+    fn records_tool_calls_on_newly_added_assistant_message() {
+        let mut history = vec![uni::Message::user("u".to_string())];
+        let tool_calls = vec![PreparedAssistantToolCall::new(uni::ToolCall::function(
+            "call_1".to_string(),
+            "code_search".to_string(),
+            r#"{"query":"foo"}"#.to_string(),
+        ))];
+
+        let len_before_assistant = history.len();
+        history.push(uni::Message::assistant("Searching now.".to_string()));
+
+        record_assistant_tool_calls(&mut history, &tool_calls, len_before_assistant);
+
+        assert_eq!(history.len(), 2);
+        let last = history.last().expect("assistant message");
+        assert_eq!(last.role, uni::MessageRole::Assistant);
+        assert_eq!(last.phase, Some(uni::AssistantPhase::Commentary));
+        assert_eq!(last.tool_calls.as_ref().map(|calls| calls[0].id.clone()).as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn appends_tool_call_message_when_no_assistant_message_was_added() {
+        let mut history = vec![uni::Message::user("u".to_string())];
+        let tool_calls = vec![PreparedAssistantToolCall::new(uni::ToolCall::function(
+            "call_1".to_string(),
+            "code_search".to_string(),
+            r#"{"query":"foo"}"#.to_string(),
+        ))];
+
+        let len_before_assistant = history.len();
+        record_assistant_tool_calls(&mut history, &tool_calls, len_before_assistant);
+
+        assert_eq!(history.len(), 2);
+        let last = history.last().expect("synthetic assistant tool call message");
+        assert_eq!(last.role, uni::MessageRole::Assistant);
+        assert_eq!(last.content.as_text(), "");
+        assert_eq!(last.phase, Some(uni::AssistantPhase::Commentary));
+        assert_eq!(last.tool_calls.as_ref().map(|calls| calls[0].id.clone()).as_deref(), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn recovery_tool_calls_break_turn_as_blocked() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        let tool_calls = vec![PreparedAssistantToolCall::new(uni::ToolCall::function(
+            "call_1".to_string(),
+            "code_search".to_string(),
+            r#"{"query":"loop"}"#.to_string(),
+        ))];
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::ToolCalls {
+                tool_calls,
+                assistant_text: String::new(),
+                reasoning: Vec::new(),
+                reasoning_details: None,
+            },
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("recovery tool calls should be handled");
+
+        assert!(matches!(
+            outcome,
+            TurnHandlerOutcome::Break(TurnLoopResult::Blocked { reason: Some(reason) })
+            if reason == RECOVERY_CONTRACT_VIOLATION_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_empty_response_emits_fallback_and_completes_turn() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::Empty,
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("recovery empty response should be handled");
+
+        assert!(matches!(outcome, TurnHandlerOutcome::Break(TurnLoopResult::Completed)));
+        assert!(backing.last_history_message_contains(
+            "I couldn't produce a final synthesis because the model returned no answer on the recovery pass."
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_empty_response_fallback_includes_user_request_and_recent_tool_outputs() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.working_history.push(uni::Message::user("tell me more".to_string()));
+        ctx.working_history
+            .push(uni::Message::tool_response("call_1".to_string(), "first tool output".to_string()));
+        ctx.working_history
+            .push(uni::Message::tool_response("call_2".to_string(), "second tool output".to_string()));
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::Empty,
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("recovery empty response should be handled");
+
+        assert!(matches!(outcome, TurnHandlerOutcome::Break(TurnLoopResult::Completed)));
+        assert!(backing.last_history_message_contains("Latest user request: tell me more"));
+        assert!(backing.last_history_message_contains("Tool output 1: second tool output"));
+        assert!(backing.last_history_message_contains("Tool output 2: first tool output"));
+    }
+
+    #[tokio::test]
+    async fn recovery_empty_response_fallback_uses_spool_excerpt_when_available() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        let spool_dir = ctx.tool_registry.workspace_root().join(".vtcode/context/tool_outputs");
+        std::fs::create_dir_all(&spool_dir).expect("spool dir");
+        std::fs::write(
+            spool_dir.join("read_1.txt"),
+            (1..=30)
+                .map(|idx| format!("fallback-line-{idx}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("spool file");
+
+        ctx.working_history
+            .push(uni::Message::user("summarize the failed read".to_string()));
+        ctx.working_history.push(uni::Message::tool_response(
+            "call_1".to_string(),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "spool_path": ".vtcode/context/tool_outputs/read_1.txt"
+            })
+            .to_string(),
+        ));
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::Empty,
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("recovery empty response should be handled");
+
+        assert!(matches!(outcome, TurnHandlerOutcome::Break(TurnLoopResult::Completed)));
+        assert!(backing.last_history_message_contains("source_path: src/main.rs"));
+        assert!(backing.last_history_message_contains("fallback-line-1"));
+        assert!(backing.last_history_message_contains("Spool excerpt:"));
+    }
+
+    #[tokio::test]
+    async fn recovery_retry_empty_response_emits_fallback_and_completes_turn() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.push_system_message("prior context");
+        ctx.activate_recovery_with_mode("empty response", RecoveryMode::ToolEnabledRetry);
+        assert!(ctx.consume_recovery_pass());
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::Empty,
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("recovery retry empty response should be handled");
+
+        assert!(matches!(outcome, TurnHandlerOutcome::Break(TurnLoopResult::Completed)));
+        assert!(
+            backing.last_history_message_contains(
+                "I couldn't continue because the model returned no answer twice in a row."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_textual_tool_markup_breaks_turn_as_blocked() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::TextResponse {
+                text: r#"
+<minimax:tool_call>
+<invoke name="apply_patch">
+<parameter name="action">read</parameter>
+<parameter name="path">crates/codegen/vtcode-core/src/core/agent/runtime/mod.rs</parameter>
+</invoke>
+</minimax:tool_call>
+"#
+                .to_string(),
+                reasoning: Vec::new(),
+                reasoning_details: None,
+                proposed_plan: None,
+            },
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("recovery textual tool markup should be handled");
+
+        assert!(matches!(
+            outcome,
+            TurnHandlerOutcome::Break(TurnLoopResult::Blocked { reason: Some(reason) })
+            if reason == RECOVERY_CONTRACT_VIOLATION_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_textual_tool_markup_with_prose_strips_region_and_completes() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::TextResponse {
+                text: r#"The requested change was not applied because tools were disabled.
+<minimax:tool_call>
+<invoke name="apply_patch">
+<parameter name="action">write</parameter>
+<parameter name="path">README.md</parameter>
+</invoke>
+</minimax:tool_call>
+Please re-run with tools enabled."#
+                    .to_string(),
+                reasoning: Vec::new(),
+                reasoning_details: None,
+                proposed_plan: None,
+            },
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("recovery textual tool markup should be stripped");
+
+        assert!(matches!(outcome, TurnHandlerOutcome::Break(TurnLoopResult::Completed)));
+        assert!(
+            backing.last_history_message_contains("The requested change was not applied because tools were disabled.")
+        );
+        assert!(backing.last_history_message_contains("Please re-run with tools enabled."));
+        assert!(!backing.last_history_message_contains("<invoke"));
+    }
+
+    #[tokio::test]
+    async fn empty_response_schedules_tool_enabled_retry_without_prior_tool_activity() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = {
+            let mut ctx = backing.turn_processing_context();
+            handle_turn_processing_result(HandleTurnProcessingResultParams {
+                ctx: &mut ctx,
+                processing_result: TurnProcessingResult::Empty,
+                response_streamed: true,
+                step_count: 1,
+                repeated_tool_attempts: &mut repeated_tool_attempts,
+                turn_modified_files: &mut turn_modified_files,
+                max_tool_loops: 4,
+                tool_repeat_limit: 4,
+            })
+            .await
+            .expect("empty response should schedule recovery")
+        };
+
+        assert!(matches!(outcome, TurnHandlerOutcome::Continue));
+        assert!(!backing.recovery_is_tool_free());
+        assert!(backing.last_history_message_contains("Tools remain available"));
+    }
+
+    #[tokio::test]
+    async fn empty_response_after_tool_activity_schedules_tool_free_recovery() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = {
+            let mut ctx = backing.turn_processing_context();
+            ctx.working_history
+                .push(uni::Message::assistant("Running cargo fmt now.".to_string()).with_tool_calls(vec![
+                    uni::ToolCall::function(
+                        "call_1".to_string(),
+                        "exec_command".to_string(),
+                        r#"{"action":"run","command":"cargo fmt"}"#.to_string(),
+                    ),
+                ]));
+            ctx.working_history
+                .push(uni::Message::tool_response("call_1".to_string(), "formatted".to_string()));
+
+            handle_turn_processing_result(HandleTurnProcessingResultParams {
+                ctx: &mut ctx,
+                processing_result: TurnProcessingResult::Empty,
+                response_streamed: true,
+                step_count: 1,
+                repeated_tool_attempts: &mut repeated_tool_attempts,
+                turn_modified_files: &mut turn_modified_files,
+                max_tool_loops: 4,
+                tool_repeat_limit: 4,
+            })
+            .await
+            .expect("empty response after tool activity should schedule synthesis recovery")
+        };
+
+        assert!(matches!(outcome, TurnHandlerOutcome::Continue));
+        assert!(backing.recovery_is_tool_free());
+    }
+
+    /// Regression test for TD-015: text containing malformed `<tool_call>` tags
+    /// that `detect_textual_tool_call` cannot parse must still be caught by the
+    /// recovery guard via `contains_pseudo_tool_call_markers`.
+    #[tokio::test]
+    async fn recovery_non_parseable_tool_call_marker_breaks_turn() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        // Malformed markup: <tool_call> wrapping <function=...> with <parameter=>
+        // tags that `detect_textual_tool_call` cannot fully parse, but which
+        // clearly represent tool-call intent.
+        let malformed = "Since tools are disabled in this recovery pass, here is what I would \
+                         apply:\n\
+                         <tool_call>\n\
+                         <function=apply_patch>\n\
+                         <parameter=patch>--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n</parameter=patch>\n\
+                         </function=apply_patch>\n\
+                         </tool_call>";
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::TextResponse {
+                text: malformed.to_string(),
+                reasoning: Vec::new(),
+                reasoning_details: None,
+                proposed_plan: None,
+            },
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("malformed tool-call markup should not panic");
+
+        // The guard must fire (Break) even though detect_textual_tool_call
+        // cannot parse the payload. After stripping, either clean prose is
+        // returned (Completed) or the text was only markup (Blocked) — either
+        // way it must not fall through to showing raw markup as a final answer.
+        assert!(
+            matches!(outcome, TurnHandlerOutcome::Break(_)),
+            "recovery with non-parseable tool_call tag should break, not continue"
+        );
+    }
+
+    /// Regression test: recovery text that contains only prose (no markers)
+    /// must pass through unmodified — the guard must not fire on clean text.
+    #[tokio::test]
+    async fn recovery_clean_prose_is_not_intercepted_by_marker_guard() {
+        let mut backing = TestTurnProcessingBacking::new(4).await;
+        let mut ctx = backing.turn_processing_context();
+        ctx.activate_recovery("loop detector");
+        assert!(ctx.consume_recovery_pass());
+
+        let mut repeated_tool_attempts = LoopTracker::new();
+        let mut turn_modified_files = BTreeSet::new();
+
+        let outcome = handle_turn_processing_result(HandleTurnProcessingResultParams {
+            ctx: &mut ctx,
+            processing_result: TurnProcessingResult::TextResponse {
+                text: "The search found 3 matches. Next step: update the failing test.".to_string(),
+                reasoning: Vec::new(),
+                reasoning_details: None,
+                proposed_plan: None,
+            },
+            response_streamed: false,
+            step_count: 1,
+            repeated_tool_attempts: &mut repeated_tool_attempts,
+            turn_modified_files: &mut turn_modified_files,
+            max_tool_loops: 4,
+            tool_repeat_limit: 4,
+        })
+        .await
+        .expect("clean recovery prose should be handled");
+
+        assert!(
+            matches!(outcome, TurnHandlerOutcome::Break(TurnLoopResult::Completed)),
+            "clean prose in recovery should complete the turn normally"
+        );
+        assert!(backing.last_history_message_contains("3 matches"));
+    }
+}

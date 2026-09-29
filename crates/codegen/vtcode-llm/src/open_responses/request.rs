@@ -1,0 +1,257 @@
+//! Request object for Open Responses.
+//!
+//! The Request is the top-level object sent to the API,
+//! containing input items, tool definitions, and model parameters.
+
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+
+use super::{MessageRole, OutputItem};
+use crate::provider::ToolDefinition;
+
+/// The main request object per the Open Responses specification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Request {
+    /// The model to use for the request.
+    pub model: String,
+
+    /// The input items that form the context for the model.
+    /// Per the spec, these are polymorphic items (messages, tool outputs, etc.).
+    pub input: Vec<OutputItem>,
+
+    /// Tools available to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
+
+    /// Tool choice parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Whether to stream the response.
+    #[serde(default)]
+    pub stream: bool,
+
+    /// Sampling temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
+    /// Nucleus sampling parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+
+    /// Truncation configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<Box<TruncationConfig>>,
+
+    /// Maximum output tokens allowed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+
+    /// Maximum tool calls allowed in a single request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u64>,
+
+    /// Stop sequences for the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+
+    /// Presence penalty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+
+    /// Frequency penalty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+
+    /// Logit bias for token sampling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<hashbrown::HashMap<String, f64>>,
+
+    /// Whether to return log probabilities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+
+    /// Number of top log probabilities to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+
+    /// User ID for tracking and rate limiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Service tier requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+
+    /// Reasoning configuration.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_boxed_reasoning_config_opt"
+    )]
+    pub reasoning: Option<Box<ReasoningConfig>>,
+
+    /// Whether to store the request/response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+
+    /// Optional ID of the previous response for server-side continuity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+
+    /// Optional response fields to include.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+
+    /// Metadata for the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+/// Reasoning configuration for the request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningConfig {
+    /// Reasoning effort level (low, medium, high).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl ReasoningConfig {
+    fn is_empty(&self) -> bool {
+        self.effort.is_none()
+    }
+
+    fn into_boxed_if_non_empty(self) -> Option<Box<Self>> {
+        (!self.is_empty()).then_some(Box::new(self))
+    }
+}
+
+/// Truncation configuration for the request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TruncationConfig {
+    /// The truncation strategy to use.
+    pub strategy: String,
+    /// The number of tokens to keep.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_prompt_tokens: Option<u64>,
+}
+
+impl Request {
+    /// Creates a new request with the given model and input.
+    pub fn new(model: impl Into<String>, input: Vec<OutputItem>) -> Self {
+        Self {
+            model: model.into(),
+            input,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            temperature: None,
+            top_p: None,
+            truncation: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            service_tier: None,
+            reasoning: None,
+            store: None,
+            previous_response_id: None,
+            include: None,
+            metadata: None,
+        }
+    }
+
+    /// Convenience method to create a request from a single user message.
+    pub fn from_message(model: impl Into<String>, text: impl Into<String>) -> Self {
+        let item =
+            OutputItem::completed_message("msg_init", MessageRole::User, vec![super::ContentPart::input_text(text)]);
+        Self::new(model, vec![item])
+    }
+}
+
+fn deserialize_boxed_reasoning_config_opt<'de, D>(deserializer: D) -> Result<Option<Box<ReasoningConfig>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<ReasoningConfig>::deserialize(deserializer)
+        .map(|value| value.and_then(ReasoningConfig::into_boxed_if_non_empty))
+}
+
+/// Tool choice options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// Standard tool choice mode (auto, none, required).
+    Mode(ToolChoiceMode),
+    /// Specific tool to call.
+    Tool(SpecificToolChoice),
+}
+
+/// Standard tool choice modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoiceMode {
+    /// Model decides whether to call a tool.
+    Auto,
+    /// Model MUST NOT call any tools.
+    None,
+    /// Model MUST call at least one tool.
+    Required,
+}
+
+/// Specific tool choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecificToolChoice {
+    /// The type of the tool, always "function".
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    /// The name of the function to call.
+    pub function: FunctionName,
+}
+
+/// Function name wrapper for tool choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionName {
+    /// Name of the function.
+    pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_serialization() {
+        let req = Request::from_message("gpt-5", "Hello");
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"model\":\"gpt-5\""));
+        assert!(json.contains("\"input\":["));
+        assert!(json.contains("\"type\":\"message\""));
+    }
+
+    #[test]
+    fn empty_reasoning_config_deserializes_to_none() {
+        let req: Request = serde_json::from_str(
+            r#"{
+                "model": "gpt-5",
+                "input": [],
+                "reasoning": {}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(req.reasoning.is_none());
+    }
+
+    #[test]
+    fn boxed_reasoning_config_is_smaller_than_inline_option() {
+        use std::mem::size_of;
+
+        assert!(size_of::<Option<Box<ReasoningConfig>>>() < size_of::<Option<ReasoningConfig>>());
+    }
+}

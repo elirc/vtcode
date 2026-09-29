@@ -1,0 +1,94 @@
+use anyhow::Result;
+use itertools::Itertools;
+use std::path::Path;
+use vtcode_core::config::types::AgentConfig as CoreAgentConfig;
+use vtcode_core::utils::colors::style;
+use vtcode_core::utils::file_utils::{ensure_dir_exists, ensure_dir_exists_sync, write_file_with_context_sync};
+
+/// Handle the create-project command
+pub async fn handle_create_project_command(config: &CoreAgentConfig, name: &str, features: &[String]) -> Result<()> {
+    println!("{}", style("[CREATE]").cyan().bold());
+    println!("  {:16} {}", "name", name);
+    println!("  {:16} {}", "workspace", config.workspace.display());
+    if !features.is_empty() {
+        println!("  {:16} {}\n", "features", features.join(", "));
+    } else {
+        println!();
+    }
+
+    // Project creation implementation
+    let project_path = config.workspace.join(name);
+
+    // Create project directory
+    ensure_dir_exists(&project_path).await?;
+    println!("Created project directory: {}", project_path.display());
+
+    // Create basic project structure based on features
+    create_project_structure(&project_path, features)?;
+
+    // Create vtcode configuration
+    create_vtcode_config(&project_path)?;
+
+    println!("Project '{name}' created successfully!");
+
+    Ok(())
+}
+
+/// Create project structure based on selected features
+fn create_project_structure(project_path: &Path, features: &[String]) -> Result<()> {
+    // Create src directory
+    let src_path = project_path.join("src");
+    ensure_dir_exists_sync(&src_path)?;
+
+    // Create main file (simple template; extend later for feature-specific scaffolds)
+    let main_content = r#"fn main() {
+    println!("Hello, world!");
+}
+"#;
+
+    write_file_with_context_sync(&src_path.join("main.rs"), main_content, "main.rs")?;
+
+    // Create README.md
+    let readme_content = format!(
+        r#"# Project
+
+This is a new project created with VT Code.
+
+## Features
+
+{}"#,
+        features.iter().map(|f| format!("- {f}\n")).join("")
+    );
+
+    write_file_with_context_sync(&project_path.join("README.md"), &readme_content, "README.md")?;
+
+    // Create Cargo.toml for Rust projects
+    let cargo_content = r#"[package]
+name = "project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+"#;
+
+    write_file_with_context_sync(&project_path.join("Cargo.toml"), cargo_content, "Cargo.toml")?;
+
+    Ok(())
+}
+
+/// Create vtcode configuration file
+fn create_vtcode_config(project_path: &Path) -> Result<()> {
+    let config_content = r#"# VT Code Configuration
+[model]
+name = "gemini-3-flash-preview"
+
+[workspace]
+path = "."
+
+[agent]
+verbose = false
+"#;
+
+    write_file_with_context_sync(&project_path.join("vtcode.toml"), config_content, "vtcode.toml")?;
+    Ok(())
+}

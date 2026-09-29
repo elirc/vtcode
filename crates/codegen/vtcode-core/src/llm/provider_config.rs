@@ -1,0 +1,382 @@
+use crate::config::TimeoutsConfig;
+use crate::config::core::{GeminiPromptCacheSettings, PromptCachingConfig};
+use crate::llm::cgp::{CanDescribeProvider, ProviderMetadataProvider};
+use crate::llm::factory::{self, ProviderConfig as FactoryProviderConfig};
+use crate::llm::provider::{LLMError, LLMProvider};
+use crate::llm::provider_builder::ProviderConfig as LegacyProviderConfig;
+
+macro_rules! define_provider_config {
+    ($(#[$meta:meta])* $name:ident, $key:literal, $display:literal, $default_model:expr, $api_base:expr, $env_var:expr, $prompt_cache_settings:ty) => {
+        $(#[$meta])*
+        pub struct $name;
+
+        impl ProviderMetadataProvider<$name> for $name {
+            const PROVIDER_KEY: &'static str = $key;
+            const DISPLAY_NAME: &'static str = $display;
+            const DEFAULT_MODEL: &'static str = $default_model;
+            const API_BASE_URL: &'static str = $api_base;
+            const BASE_URL_ENV_VAR: Option<&'static str> = $env_var;
+        }
+
+        impl LegacyProviderConfig for $name {
+            const PROVIDER_KEY: &'static str = <Self as CanDescribeProvider>::PROVIDER_KEY;
+            const DISPLAY_NAME: &'static str = <Self as CanDescribeProvider>::DISPLAY_NAME;
+            const DEFAULT_MODEL: &'static str = <Self as CanDescribeProvider>::DEFAULT_MODEL;
+            const API_BASE_URL: &'static str = <Self as CanDescribeProvider>::API_BASE_URL;
+            const BASE_URL_ENV_VAR: Option<&'static str> =
+                <Self as CanDescribeProvider>::BASE_URL_ENV_VAR;
+
+            type PromptCacheSettings = $prompt_cache_settings;
+        }
+    };
+}
+
+define_provider_config!(
+    /// Provider configuration for Google Gemini.
+    GeminiProviderConfig,
+    "gemini",
+    "Gemini",
+    crate::config::constants::models::google::GEMINI_3_FLASH_PREVIEW,
+    crate::config::constants::urls::GEMINI_API_BASE,
+    Some(crate::config::constants::env_vars::GEMINI_BASE_URL),
+    GeminiPromptCacheSettings
+);
+define_provider_config!(
+    /// Provider configuration for Anthropic.
+    AnthropicProviderConfig,
+    "anthropic",
+    "Anthropic",
+    crate::config::constants::models::anthropic::DEFAULT_MODEL,
+    crate::config::constants::urls::ANTHROPIC_API_BASE,
+    Some(crate::config::constants::env_vars::ANTHROPIC_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for GitHub Copilot.
+    CopilotProviderConfig,
+    "copilot",
+    "GitHub Copilot",
+    crate::config::constants::models::copilot::DEFAULT_MODEL,
+    "",
+    None,
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for OpenAI.
+    OpenAIProviderConfig,
+    "openai",
+    "OpenAI",
+    crate::config::constants::models::openai::DEFAULT_MODEL,
+    crate::config::constants::urls::OPENAI_API_BASE,
+    Some(crate::config::constants::env_vars::OPENAI_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for HuggingFace Inference API.
+    HuggingFaceProviderConfig,
+    "huggingface",
+    "HuggingFace",
+    crate::config::constants::models::huggingface::DEFAULT_MODEL,
+    crate::config::constants::urls::HUGGINGFACE_API_BASE,
+    Some(crate::config::constants::env_vars::HUGGINGFACE_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for DeepSeek.
+    DeepSeekProviderConfig,
+    "deepseek",
+    "DeepSeek",
+    crate::config::constants::models::deepseek::DEEPSEEK_V4_PRO,
+    crate::config::constants::urls::DEEPSEEK_API_BASE,
+    Some(crate::config::constants::env_vars::DEEPSEEK_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Mistral AI.
+    MistralProviderConfig,
+    "mistral",
+    "Mistral",
+    crate::config::constants::models::mistral::MISTRAL_LARGE_3,
+    crate::config::constants::urls::MISTRAL_API_BASE,
+    Some(crate::config::constants::env_vars::MISTRAL_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Moonshot AI.
+    MoonshotProviderConfig,
+    "moonshot",
+    "Moonshot",
+    crate::config::constants::models::moonshot::DEFAULT_MODEL,
+    crate::config::constants::urls::MOONSHOT_API_BASE,
+    Some(crate::config::constants::env_vars::MOONSHOT_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Z.AI (GLM).
+    ZAIProviderConfig,
+    "zai",
+    "Z.AI",
+    crate::config::constants::models::zai::DEFAULT_MODEL,
+    crate::config::constants::urls::Z_AI_API_BASE,
+    Some(crate::config::constants::env_vars::ZAI_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for OpenRouter.
+    OpenRouterProviderConfig,
+    "openrouter",
+    "OpenRouter",
+    "openrouter/auto",
+    crate::config::constants::urls::OPENROUTER_API_BASE,
+    Some(crate::config::constants::env_vars::OPENROUTER_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for OpenResponses.
+    OpenResponsesProviderConfig,
+    "openresponses",
+    "OpenResponses",
+    crate::config::constants::models::openresponses::DEFAULT_MODEL,
+    crate::config::constants::urls::OPENRESPONSES_API_BASE,
+    Some(crate::config::constants::env_vars::OPENRESPONSES_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Ollama (local inference).
+    OllamaProviderConfig,
+    "ollama",
+    "Ollama",
+    "gpt-oss:20b",
+    "http://localhost:11434",
+    None,
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for LM Studio (local inference).
+    LmStudioProviderConfig,
+    "lmstudio",
+    "LM Studio",
+    crate::config::constants::models::lmstudio::DEFAULT_MODEL,
+    crate::config::constants::urls::LMSTUDIO_API_BASE,
+    Some(crate::config::constants::env_vars::LMSTUDIO_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for llama.cpp (local inference).
+    LlamaCppProviderConfig,
+    "llamacpp",
+    "llama.cpp",
+    crate::config::constants::models::llamacpp::DEFAULT_MODEL,
+    crate::config::constants::urls::LLAMACPP_API_BASE,
+    Some(crate::config::constants::env_vars::LLAMACPP_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Xiaomi MiMo.
+    MiMoProviderConfig,
+    "mimo",
+    "Xiaomi MiMo",
+    crate::config::constants::models::mimo::DEFAULT_MODEL,
+    crate::config::constants::urls::MIMO_API_BASE,
+    Some(crate::config::constants::env_vars::MIMO_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Minimax.
+    MinimaxProviderConfig,
+    "minimax",
+    "Minimax",
+    crate::config::constants::models::minimax::DEFAULT_MODEL,
+    crate::config::constants::urls::MINIMAX_API_BASE,
+    Some(crate::config::constants::env_vars::MINIMAX_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for OpenCode Zen.
+    OpenCodeZenProviderConfig,
+    "opencode-zen",
+    "OpenCode Zen",
+    crate::config::constants::models::opencode_zen::DEFAULT_MODEL,
+    crate::config::constants::urls::OPENCODE_ZEN_API_BASE,
+    Some(crate::config::constants::env_vars::OPENCODE_ZEN_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for OpenCode Go.
+    OpenCodeGoProviderConfig,
+    "opencode-go",
+    "OpenCode Go",
+    crate::config::constants::models::opencode_go::DEFAULT_MODEL,
+    crate::config::constants::urls::OPENCODE_GO_API_BASE,
+    Some(crate::config::constants::env_vars::OPENCODE_GO_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Qwen.
+    QwenProviderConfig,
+    "qwen",
+    "Qwen",
+    crate::config::constants::models::qwen::DEFAULT_MODEL,
+    crate::config::constants::urls::QWEN_API_BASE,
+    Some(crate::config::constants::env_vars::QWEN_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for StepFun.
+    StepFunProviderConfig,
+    "stepfun",
+    "StepFun",
+    crate::config::constants::models::stepfun::DEFAULT_MODEL,
+    crate::config::constants::urls::STEPFUN_API_BASE,
+    Some(crate::config::constants::env_vars::STEPFUN_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Evolink.
+    EvolinkProviderConfig,
+    "evolink",
+    "Evolink",
+    crate::config::constants::models::evolink::DEFAULT_MODEL,
+    crate::config::constants::urls::EVOLINK_API_BASE,
+    Some(crate::config::constants::env_vars::EVOLINK_BASE_URL),
+    ()
+);
+define_provider_config!(
+    /// Provider configuration for Poolside.
+    PoolsideProviderConfig,
+    "poolside",
+    "Poolside",
+    crate::config::constants::models::poolside::DEFAULT_MODEL,
+    crate::config::constants::urls::POOLSIDE_API_BASE,
+    Some(crate::config::constants::env_vars::POOLSIDE_BASE_URL),
+    ()
+);
+
+/// Macro kept for source compatibility with older builder-based call sites.
+#[macro_export]
+macro_rules! create_provider_builder {
+    ($config_type:ty) => {
+        $crate::llm::provider_builder::ProviderBuilder::<$config_type>::new()
+    };
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed.len() == value.len() {
+            Some(value)
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+/// Compatibility shim that forwards legacy builder/config callers into the
+/// canonical provider factory.
+pub fn create_provider_unified(
+    provider_name: &str,
+    api_key: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    prompt_cache: Option<PromptCachingConfig>,
+    timeouts: Option<TimeoutsConfig>,
+) -> Result<Box<dyn LLMProvider>, LLMError> {
+    factory::create_provider_with_config(
+        provider_name,
+        FactoryProviderConfig {
+            api_key: non_empty(api_key),
+            openai_chatgpt_auth: None,
+            copilot_auth: None,
+            base_url: non_empty(base_url),
+            model: non_empty(model),
+            prompt_cache,
+            timeouts,
+            openai: None,
+            anthropic: None,
+            model_behavior: None,
+            workspace_root: None,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::provider_builder::ProviderBuilder;
+
+    #[test]
+    fn unified_provider_creation_supports_huggingface_through_factory() {
+        let provider = create_provider_unified(
+            "huggingface",
+            Some("test-key".to_string()),
+            Some("openai/gpt-oss-20b".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("shim should route through the factory");
+
+        assert_eq!(provider.name(), "huggingface");
+    }
+
+    #[test]
+    fn builder_shim_routes_through_factory() {
+        let provider = ProviderBuilder::<OpenAIProviderConfig>::new()
+            .api_key("test-key".to_string())
+            .model(crate::config::constants::models::openai::DEFAULT_MODEL.to_string())
+            .try_build()
+            .expect("builder shim should resolve via the factory");
+
+        assert_eq!(provider.name(), "openai");
+    }
+
+    #[test]
+    fn legacy_provider_config_create_provider_routes_through_factory() {
+        let provider = <OpenAIProviderConfig as crate::llm::provider_builder::ProviderConfig>::create_provider(
+            "test-key".to_string(),
+            crate::config::constants::models::openai::DEFAULT_MODEL.to_string(),
+            crate::config::constants::urls::OPENAI_API_BASE.to_string(),
+            false,
+            (),
+            TimeoutsConfig::default(),
+        );
+
+        assert_eq!(provider.name(), "openai");
+    }
+
+    #[test]
+    fn unified_provider_creation_matches_factory_behavior() {
+        let shim = create_provider_unified(
+            "ollama",
+            None,
+            Some("gpt-oss:20b".to_string()),
+            Some("http://localhost:11434".to_string()),
+            None,
+            Some(TimeoutsConfig::default()),
+        )
+        .expect("shim provider should build");
+
+        let factory = factory::create_provider_with_config(
+            "ollama",
+            FactoryProviderConfig {
+                api_key: None,
+                openai_chatgpt_auth: None,
+                copilot_auth: None,
+                base_url: Some("http://localhost:11434".to_string()),
+                model: Some("gpt-oss:20b".to_string()),
+                prompt_cache: None,
+                timeouts: Some(TimeoutsConfig::default()),
+                openai: None,
+                anthropic: None,
+                model_behavior: None,
+                workspace_root: None,
+            },
+        )
+        .expect("factory provider should build");
+
+        assert_eq!(shim.name(), factory.name());
+        assert_eq!(shim.supported_models(), factory.supported_models());
+    }
+}
